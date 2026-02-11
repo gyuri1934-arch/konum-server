@@ -1,0 +1,46 @@
+fastapi==0.109.0
+uvicorn==0.27.0
+python-multipart==0.0.6
+```
+
+**`Procfile`** (uzantısız):
+```
+web: uvicorn server:app --host 0.0.0.0 --port $PORT
+```
+
+Sayfanın altındaki **Commit changes** butonuna bas. ✅
+
+---
+
+## **4. Render Hesabı Aç**
+
+[render.com](https://render.com) → **Get Started for Free** → **GitHub ile giriş yap** (az önce açtığın hesap)
+
+---
+
+## **5. Render'da Deploy**
+
+1. Dashboard → **New +** → **Web Service**
+2. **Connect a repository** → `konum-server` seç → **Connect**
+3. Şu ayarları yap:
+
+| Alan | Değer |
+|------|-------|
+| **Name** | `konum-server` |
+| **Region** | Frankfurt (EU) |
+| **Branch** | main |
+| **Runtime** | Python 3 |
+| **Build Command** | `pip install -r requirements.txt` |
+| **Start Command** | `uvicorn server:app --host 0.0.0.0 --port $PORT` |
+| **Instance Type** | **Free** |
+
+4. **Create Web Service** butonuna bas
+5. 2-3 dakika bekle...
+
+---
+
+## **6. URL'ni Al**
+
+Deploy tamamlanınca:
+```
+https://konum-server.onrender.com
