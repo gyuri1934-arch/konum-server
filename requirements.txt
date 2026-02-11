@@ -1,6 +1,6 @@
-fastapi==0.109.0
-uvicorn==0.27.0
-python-multipart==0.0.6
+fastapi==0.110.0
+uvicorn[standard]==0.27.1
+pydantic==2.6.4
 ```
 
 **`Procfile`** (uzantısız):
@@ -43,4 +43,5 @@ Sayfanın altındaki **Commit changes** butonuna bas. ✅
 
 Deploy tamamlanınca:
 ```
+
 https://konum-server.onrender.com
