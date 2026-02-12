@@ -1,8 +1,8 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from datetime import datetime
-from typing import Optional
+from datetime import datetime, timedelta
+from typing import Optional, List
 import time
 
 app = FastAPI(title="Konum Takip Server")
@@ -17,7 +17,8 @@ app.add_middleware(
 users_locations = {}
 conversations = {}
 read_timestamps = {}
-rooms = {}  # ✅ Oda listesi: {"room_name": {"password": "1234", "created_by": "user1", "created_at": "..."}}
+rooms = {}
+location_history = {}  # ✅ {"userId": [{"lat": ..., "lng": ..., "timestamp": "2025-02-12 14:30:00"}, ...]}
 
 class LocationModel(BaseModel):
     userId: str
@@ -27,7 +28,7 @@ class LocationModel(BaseModel):
     altitude: float = 0.0
     speed: float = 0.0
     animationType: str = "pulse"
-    roomName: str = "Genel"  # ✅ Oda adı
+    roomName: str = "Genel"
 
 class MessageModel(BaseModel):
     fromUser: str
@@ -49,8 +50,8 @@ def get_conversation_key(user1: str, user2: str):
 @app.get("/")
 def home():
     total_messages = sum(len(msgs) for msgs in conversations.values())
+    total_history = sum(len(h) for h in location_history.values())
     
-    # Odalara göre kullanıcıları grupla
     rooms_info = {}
     for u in users_locations.values():
         room = u.get('roomName', 'Genel')
@@ -72,9 +73,10 @@ def home():
     return {
         "status": "✅ Server çalışıyor!",
         "toplam_kullanici": len(users_locations),
-        "toplam_oda": len(rooms) + 1,  # +1 Genel oda
+        "toplam_oda": len(rooms) + 1,
         "toplam_konusma": len(conversations),
         "toplam_mesaj": total_messages,
+        "toplam_gecmis_nokta": total_history,
         "odalar_html": rooms_html
     }
 
@@ -82,7 +84,6 @@ def home():
 def ping():
     return {"status": "alive"}
 
-# ✅ ODA OLUŞTUR
 @app.post("/create_room")
 def create_room(data: RoomCreateModel):
     try:
@@ -109,7 +110,6 @@ def create_room(data: RoomCreateModel):
         print(f"❌ Hata: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-# ✅ ODAYA KATIL (Şifre kontrolü)
 @app.post("/join_room")
 def join_room(data: RoomJoinModel):
     try:
@@ -130,7 +130,6 @@ def join_room(data: RoomJoinModel):
         print(f"❌ Hata: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-# ✅ ODA LİSTESİ
 @app.get("/get_rooms")
 def get_rooms():
     try:
@@ -166,20 +165,35 @@ def update_location(data: LocationModel):
             "altitude": data.altitude,
             "speed": data.speed,
             "animationType": data.animationType,
-            "roomName": data.roomName,  # ✅ Oda bilgisi kaydet
+            "roomName": data.roomName,
             "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "last_seen": time.time()
         }
         
+        if data.userId not in location_history:
+            location_history[data.userId] = []
+        
+        location_history[data.userId].append({
+            "lat": data.lat,
+            "lng": data.lng,
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "speed": data.speed,
+            "altitude": data.altitude
+        })
+        
+        # ✅ Son 1000 noktayı tut (1 yıllık veri için)
+        if len(location_history[data.userId]) > 1000:
+            location_history[data.userId] = location_history[data.userId][-1000:]
+        
         print(f"✅ Konum: {data.userId} ({data.deviceType}) - 🚪 {data.roomName}")
         print(f"   📍 {data.lat:.5f}, {data.lng:.5f}  ⛰️ {data.altitude:.1f}m  🚗 {data.speed:.1f}km/h  🎭 {data.animationType}")
+        print(f"   📜 Geçmiş: {len(location_history[data.userId])} nokta")
         
         return {"status": "success"}
     except Exception as e:
         print(f"❌ Hata: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-# ✅ KONUM LİSTESİ (Oda filtrelemeli)
 @app.get("/get_locations/{room_name}")
 def get_locations(room_name: str):
     try:
@@ -196,7 +210,6 @@ def get_locations(room_name: str):
             del users_locations[uid]
             print(f"🧹 Otomatik silindi (timeout): {uid}")
         
-        # ✅ Sadece aynı odadaki kullanıcıları gönder
         locations = [
             {
                 "userId": u["userId"],
@@ -217,6 +230,64 @@ def get_locations(room_name: str):
     except Exception as e:
         print(f"❌ Hata: {e}")
         return []
+
+# ✅ KONUM GEÇMİŞİNİ GETIR (TARİH FİLTRELİ)
+@app.get("/get_location_history/{user_id}")
+def get_location_history(
+    user_id: str,
+    period: str = "all"  # all, day, week, month, year
+):
+    try:
+        history = location_history.get(user_id, [])
+        
+        if not history:
+            return []
+        
+        # Filtreleme
+        now = datetime.now()
+        filtered = []
+        
+        for point in history:
+            try:
+                point_time = datetime.strptime(point["timestamp"], "%Y-%m-%d %H:%M:%S")
+                
+                if period == "all":
+                    filtered.append(point)
+                elif period == "day":
+                    if now - point_time <= timedelta(days=1):
+                        filtered.append(point)
+                elif period == "week":
+                    if now - point_time <= timedelta(weeks=1):
+                        filtered.append(point)
+                elif period == "month":
+                    if now - point_time <= timedelta(days=30):
+                        filtered.append(point)
+                elif period == "year":
+                    if now - point_time <= timedelta(days=365):
+                        filtered.append(point)
+            except Exception as e:
+                print(f"⚠️ Zaman parse hatası: {e}")
+                continue
+        
+        print(f"📜 Geçmiş isteği: {user_id} ({period}) → {len(filtered)}/{len(history)} nokta")
+        return filtered
+        
+    except Exception as e:
+        print(f"❌ Hata: {e}")
+        return []
+
+@app.delete("/clear_history/{user_id}")
+def clear_history(user_id: str):
+    try:
+        if user_id in location_history:
+            count = len(location_history[user_id])
+            del location_history[user_id]
+            print(f"🧹 Geçmiş temizlendi: {user_id} ({count} nokta)")
+            return {"status": "success", "cleared": count}
+        return {"status": "success", "cleared": 0}
+    except Exception as e:
+        print(f"❌ Hata: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/send_message")
 def send_message(data: MessageModel):
@@ -290,6 +361,7 @@ def clear_all():
     conversations.clear()
     read_timestamps.clear()
     rooms.clear()
+    location_history.clear()
     print("🧹 Tüm veriler temizlendi")
     return {"status": "success"}
 
