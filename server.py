@@ -20,12 +20,12 @@ conversations = {}
 read_timestamps = {}
 rooms = {}
 location_history = {}
-pins = {}  # ✅ {"pin_id": {"lat": ..., "lng": ..., "creator": ..., "roomName": ..., "timestamp": ...}}
-user_scores = {}  # ✅ {"roomName_userId": score}
-pin_collection_state = {}  # ✅ {"pin_id": {"collector": "userId", "start_time": ...}}
-room_permissions = {}  # ✅ {"roomName": {"admin": "userId", "collectors": ["user1", "user2"]}}
-user_visibility = {}  # ✅ {"userId": {"mode": "all/room/custom", "allowed": ["user1"]}}
-user_pins_count = {}  # ✅ {"roomName_userId": pin_count}
+pins = {}
+user_scores = {}
+pin_collection_state = {}
+room_permissions = {}
+user_visibility = {}
+user_pins_count = {}
 
 class LocationModel(BaseModel):
     userId: str
@@ -59,7 +59,7 @@ class PinCreateModel(BaseModel):
 
 class VisibilityModel(BaseModel):
     userId: str
-    mode: str  # "all", "room", "custom", "hidden"
+    mode: str
     allowed: List[str] = []
 
 def get_conversation_key(user1: str, user2: str):
@@ -67,7 +67,7 @@ def get_conversation_key(user1: str, user2: str):
 
 def calculate_distance(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
     """Mesafe hesapla (metre cinsinden)"""
-    R = 6371000  # Dünya yarıçapı (metre)
+    R = 6371000
     phi1 = math.radians(lat1)
     phi2 = math.radians(lat2)
     delta_phi = math.radians(lat2 - lat1)
@@ -135,7 +135,6 @@ def create_room(data: RoomCreateModel):
             "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         }
         
-        # ✅ Oda oluşturulunca admin yetkisi ver
         room_permissions[data.roomName] = {
             "admin": data.createdBy,
             "collectors": []
@@ -170,22 +169,29 @@ def join_room(data: RoomJoinModel):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/get_rooms")
-def get_rooms():
+def get_rooms(user_id: str = ""):
     try:
         room_list = [
             {
                 "name": "Genel",
                 "hasPassword": False,
-                "userCount": sum(1 for u in users_locations.values() if u.get('roomName', 'Genel') == 'Genel')
+                "userCount": sum(1 for u in users_locations.values() if u.get('roomName', 'Genel') == 'Genel'),
+                "isAdmin": False,
+                "password": None
             }
         ]
         
         for room_name, room_data in rooms.items():
+            perms = room_permissions.get(room_name, {})
+            is_admin = perms.get("admin") == user_id
+            
             room_list.append({
                 "name": room_name,
                 "hasPassword": True,
                 "userCount": sum(1 for u in users_locations.values() if u.get('roomName', 'Genel') == room_name),
-                "createdBy": room_data["created_by"]
+                "createdBy": room_data["created_by"],
+                "isAdmin": is_admin,
+                "password": rooms[room_name]["password"] if is_admin else None
             })
         
         return room_list
@@ -193,7 +199,87 @@ def get_rooms():
         print(f"❌ Hata: {e}")
         return []
 
-# ✅ GÖRÜNÜRLİK AYARI
+@app.delete("/delete_room/{room_name}")
+def delete_room(room_name: str, admin_id: str):
+    try:
+        if room_name == "Genel":
+            raise HTTPException(status_code=400, detail="Genel oda silinemez")
+        
+        if room_name not in rooms:
+            raise HTTPException(status_code=404, detail="Oda bulunamadı")
+        
+        if room_permissions.get(room_name, {}).get("admin") != admin_id:
+            raise HTTPException(status_code=403, detail="Sadece admin oda silebilir")
+        
+        for uid, user in users_locations.items():
+            if user.get("roomName") == room_name:
+                user["roomName"] = "Genel"
+        
+        del rooms[room_name]
+        if room_name in room_permissions:
+            del room_permissions[room_name]
+        
+        pins_to_delete = [pid for pid, p in pins.items() if p["roomName"] == room_name]
+        for pid in pins_to_delete:
+            del pins[pid]
+        
+        scores_to_delete = [k for k in user_scores.keys() if k.startswith(f"{room_name}_")]
+        for k in scores_to_delete:
+            del user_scores[k]
+        
+        print(f"🗑️ Oda silindi: {room_name} (by {admin_id})")
+        return {"status": "success", "message": f"{room_name} odası silindi, üyeler Genel odaya aktarıldı"}
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        print(f"❌ Hata: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/get_room_password/{room_name}")
+def get_room_password(room_name: str, admin_id: str):
+    try:
+        if room_name == "Genel":
+            raise HTTPException(status_code=400, detail="Genel odanın şifresi yok")
+        
+        if room_name not in rooms:
+            raise HTTPException(status_code=404, detail="Oda bulunamadı")
+        
+        if room_permissions.get(room_name, {}).get("admin") != admin_id:
+            raise HTTPException(status_code=403, detail="Sadece admin şifreyi görebilir")
+        
+        password = rooms[room_name]["password"]
+        print(f"🔑 Şifre görüntülendi: {room_name} (by {admin_id})")
+        return {"password": password}
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        print(f"❌ Hata: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/change_room_password/{room_name}")
+def change_room_password(room_name: str, admin_id: str, new_password: str):
+    try:
+        if room_name == "Genel":
+            raise HTTPException(status_code=400, detail="Genel odanın şifresi değiştirilemez")
+        
+        if room_name not in rooms:
+            raise HTTPException(status_code=404, detail="Oda bulunamadı")
+        
+        if room_permissions.get(room_name, {}).get("admin") != admin_id:
+            raise HTTPException(status_code=403, detail="Sadece admin şifreyi değiştirebilir")
+        
+        if len(new_password) < 3:
+            raise HTTPException(status_code=400, detail="Şifre en az 3 karakter olmalı")
+        
+        rooms[room_name]["password"] = new_password
+        print(f"🔑 Şifre değiştirildi: {room_name} (by {admin_id})")
+        return {"status": "success", "message": "Şifre değiştirildi"}
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        print(f"❌ Hata: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.post("/set_visibility")
 def set_visibility(data: VisibilityModel):
     try:
@@ -214,7 +300,6 @@ def get_visibility(user_id: str):
 @app.post("/update_location")
 def update_location(data: LocationModel):
     try:
-        # ✅ Hareketsizlik tespiti
         user_key = data.userId
         idle_status = "online"
         idle_minutes = 0
@@ -226,9 +311,7 @@ def update_location(data: LocationModel):
                 data.lat, data.lng
             )
             
-            # 15m'den az hareket = hareketsiz
             if distance < 15:
-                # Hareketsizlik süresini hesapla
                 last_move_time = old_loc.get("last_move_time", time.time())
                 idle_seconds = time.time() - last_move_time
                 idle_minutes = int(idle_seconds / 60)
@@ -236,7 +319,6 @@ def update_location(data: LocationModel):
                 if idle_minutes > 0:
                     idle_status = "idle"
             else:
-                # Hareket etti, zamanı sıfırla
                 old_loc["last_move_time"] = time.time()
         
         users_locations[data.userId] = {
@@ -269,43 +351,34 @@ def update_location(data: LocationModel):
         if len(location_history[data.userId]) > 1000:
             location_history[data.userId] = location_history[data.userId][-1000:]
         
-        # ✅ PIN TOPLAMA KONTROLÜ
         if data.roomName in room_permissions:
             perms = room_permissions[data.roomName]
             if data.userId in perms["collectors"]:
-                # Yetkili kişi, pinleri kontrol et
                 for pin_id, pin_data in list(pins.items()):
                     if pin_data["roomName"] != data.roomName:
                         continue
                     
                     dist = calculate_distance(data.lat, data.lng, pin_data["lat"], pin_data["lng"])
                     
-                    # 20m içine girdi
                     if dist <= 20:
                         if pin_id not in pin_collection_state:
-                            # İlk giren kişi toplayıcı olur
                             pin_collection_state[pin_id] = {
                                 "collector": data.userId,
                                 "start_time": time.time()
                             }
                             print(f"📍 Pin toplama başladı: {data.userId} → {pin_id}")
                         elif pin_collection_state[pin_id]["collector"] == data.userId:
-                            # Aynı kişi hala yakın
                             pass
                     
-                    # 25m dışına çıktı
                     elif dist > 25:
                         if pin_id in pin_collection_state:
                             if pin_collection_state[pin_id]["collector"] == data.userId:
-                                # Pin toplandı!
                                 score_key = f"{data.roomName}_{data.userId}"
                                 user_scores[score_key] = user_scores.get(score_key, 0) + 1
                                 
-                                # Pin'i sil
                                 del pins[pin_id]
                                 del pin_collection_state[pin_id]
                                 
-                                # Pin sayısını azalt
                                 pin_count_key = f"{data.roomName}_{pin_data['creator']}"
                                 if pin_count_key in user_pins_count:
                                     user_pins_count[pin_count_key] -= 1
@@ -339,7 +412,6 @@ def get_locations(room_name: str, viewer_id: str = ""):
             if u.get("roomName", "Genel") != room_name:
                 continue
             
-            # ✅ Görünürlük kontrolü
             user_id = u["userId"]
             visibility = user_visibility.get(user_id, {"mode": "all", "allowed": []})
             
@@ -347,7 +419,7 @@ def get_locations(room_name: str, viewer_id: str = ""):
             if visibility["mode"] == "all":
                 visible = True
             elif visibility["mode"] == "room":
-                visible = True  # Aynı odadayız zaten
+                visible = True
             elif visibility["mode"] == "custom":
                 visible = viewer_id in visibility["allowed"]
             elif visibility["mode"] == "hidden":
@@ -427,11 +499,9 @@ def clear_history(user_id: str):
         print(f"❌ Hata: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-# ✅ PIN SİSTEMİ
 @app.post("/create_pin")
 def create_pin(data: PinCreateModel):
     try:
-        # Her üye sadece 1 pin koyabilir
         pin_count_key = f"{data.roomName}_{data.creator}"
         if user_pins_count.get(pin_count_key, 0) >= 1:
             raise HTTPException(status_code=400, detail="Zaten bir pin koydunuz!")
@@ -464,7 +534,6 @@ def get_pins(room_name: str):
             if p["roomName"] == room_name
         ]
         
-        # Pin toplama durumlarını da ekle
         for pin in room_pins:
             if pin["id"] in pin_collection_state:
                 state = pin_collection_state[pin["id"]]
@@ -489,7 +558,6 @@ def remove_pin(pin_id: str, user_id: str):
         if pin_data["creator"] != user_id:
             raise HTTPException(status_code=403, detail="Sadece kendi pininizi silebilirsiniz")
         
-        # Pin sayısını azalt
         pin_count_key = f"{pin_data['roomName']}_{user_id}"
         if pin_count_key in user_pins_count:
             user_pins_count[pin_count_key] -= 1
@@ -507,7 +575,6 @@ def remove_pin(pin_id: str, user_id: str):
         print(f"❌ Hata: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-# ✅ YETKİLENDİRME
 @app.post("/set_collector_permission/{room_name}/{user_id}")
 def set_collector_permission(room_name: str, user_id: str, admin_id: str, enabled: bool):
     try:
@@ -537,7 +604,6 @@ def set_collector_permission(room_name: str, user_id: str, admin_id: str, enable
 def get_room_permissions(room_name: str):
     return room_permissions.get(room_name, {"admin": None, "collectors": []})
 
-# ✅ SKOR SİSTEMİ
 @app.get("/get_scores/{room_name}")
 def get_scores(room_name: str):
     try:
@@ -547,7 +613,6 @@ def get_scores(room_name: str):
                 user_id = key.replace(f"{room_name}_", "")
                 scores[user_id] = score
         
-        # Sıralı liste olarak döndür
         sorted_scores = sorted(scores.items(), key=lambda x: x[1], reverse=True)
         return [{"userId": u, "score": s} for u, s in sorted_scores]
     except Exception as e:
