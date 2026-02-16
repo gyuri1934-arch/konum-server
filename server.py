@@ -26,6 +26,7 @@ pin_collection_state = {}
 room_permissions = {}
 user_visibility = {}
 user_pins_count = {}
+pin_collection_history = {}  # ✅ YENİ
 
 class LocationModel(BaseModel):
     userId: str
@@ -227,6 +228,11 @@ def delete_room(room_name: str, admin_id: str):
         for k in scores_to_delete:
             del user_scores[k]
         
+        # ✅ Pin geçmişini de temizle
+        history_to_delete = [k for k in pin_collection_history.keys() if k.startswith(f"{room_name}_")]
+        for k in history_to_delete:
+            del pin_collection_history[k]
+        
         print(f"🗑️ Oda silindi: {room_name} (by {admin_id})")
         return {"status": "success", "message": f"{room_name} odası silindi, üyeler Genel odaya aktarıldı"}
     except HTTPException as he:
@@ -375,6 +381,19 @@ def update_location(data: LocationModel):
                             if pin_collection_state[pin_id]["collector"] == data.userId:
                                 score_key = f"{data.roomName}_{data.userId}"
                                 user_scores[score_key] = user_scores.get(score_key, 0) + 1
+                                
+                                # ✅ YENİ: Pin toplama geçmişine ekle
+                                history_key = f"{data.roomName}_{data.userId}"
+                                if history_key not in pin_collection_history:
+                                    pin_collection_history[history_key] = []
+                                
+                                pin_collection_history[history_key].append({
+                                    "pinId": pin_id,
+                                    "creator": pin_data["creator"],
+                                    "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                                    "lat": pin_data["lat"],
+                                    "lng": pin_data["lng"]
+                                })
                                 
                                 del pins[pin_id]
                                 del pin_collection_state[pin_id]
@@ -608,13 +627,35 @@ def get_room_permissions(room_name: str):
 def get_scores(room_name: str):
     try:
         scores = {}
+        
         for key, score in user_scores.items():
             if key.startswith(f"{room_name}_"):
                 user_id = key.replace(f"{room_name}_", "")
                 scores[user_id] = score
         
         sorted_scores = sorted(scores.items(), key=lambda x: x[1], reverse=True)
-        return [{"userId": u, "score": s} for u, s in sorted_scores]
+        
+        result = []
+        for user_id, score in sorted_scores:
+            result.append({
+                "userId": user_id,
+                "score": score
+            })
+        
+        return result
+    except Exception as e:
+        print(f"❌ Hata: {e}")
+        return []
+
+# ✅ YENİ ENDPOINT: Pin toplama geçmişi
+@app.get("/get_collection_history/{room_name}/{user_id}")
+def get_collection_history(room_name: str, user_id: str):
+    try:
+        history_key = f"{room_name}_{user_id}"
+        history = pin_collection_history.get(history_key, [])
+        
+        print(f"📜 Pin geçmişi: {user_id} → {len(history)} pin")
+        return history
     except Exception as e:
         print(f"❌ Hata: {e}")
         return []
@@ -698,6 +739,7 @@ def clear_all():
     room_permissions.clear()
     user_visibility.clear()
     user_pins_count.clear()
+    pin_collection_history.clear()  # ✅
     print("🧹 Tüm veriler temizlendi")
     return {"status": "success"}
 
