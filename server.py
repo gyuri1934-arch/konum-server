@@ -264,7 +264,7 @@ MAX_MUSIC_CHUNKS   = 60
 # ═══════════════════════════════════════════════════════════════════════════════
 
 SUPER_ADMIN_DEVICE_IDS = {
-    "BURAYA_KENDI_CIHAZ_ID_NI_YAZ",
+    "Yürü_gagarin",
 }
 
 _failed_attempts: dict = {}
@@ -1539,3 +1539,4 @@ def transport_broadcast(data: RoomMessageModel):
         exclude_user = data.fromUser,
         data         = {"type": "transport", "fromUser": data.fromUser})
     return {"message": "✅ Yayın yapıldı"}
+
