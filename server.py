@@ -396,7 +396,9 @@ def update_location(data: LocationModel):
     if uid in locations:
         room = data.roomName
         can_collect = False
-        if room in rooms:
+        if room == "Genel":
+            can_collect = True  # Genel odada herkes toplayabilir
+        elif room in rooms:
             can_collect = uid in rooms[room].get("collectors", [])
 
         if can_collect:
