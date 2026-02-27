@@ -37,9 +37,7 @@ app.add_middleware(
 # ═══════════════════════════════════════════════════════════════════════════════
 
 locations = {}            # userId → konum verisi
-location_history = {}     # deviceId → rota geçmişi listesi (isimden bağımsız!)
-device_to_user = {}       # deviceId → güncel userId (isim takibi için)
-user_to_device = {}       # userId → deviceId (hızlı lookup)
+location_history = {}     # userId → rota geçmişi listesi
 rooms = {}                # roomName → oda bilgisi
 scores = {}               # "roomName_userId" → skor
 pin_collection_history = {}  # "roomName_userId" → toplama geçmişi
@@ -363,19 +361,13 @@ def update_location(data: LocationModel):
     else:
         idle_start = None
 
-    # 2️⃣ ROTA GEÇMİŞİNE EKLE — deviceId bazlı (isim değişse de rota korunur)
-    route_key = data.deviceId if data.deviceId else uid  # deviceId yoksa userId fallback
-    # deviceId ↔ userId eşlemesini güncelle
-    if data.deviceId:
-        device_to_user[data.deviceId] = uid
-        user_to_device[uid] = data.deviceId
-
+    # 2️⃣ ROTA GEÇMİŞİNE EKLE (HIZA GÖRE FİLTRELEME)
     should_add = False
-    if route_key not in location_history:
-        location_history[route_key] = []
+    if uid not in location_history:
+        location_history[uid] = []
         should_add = True
     else:
-        history = location_history[route_key]
+        history = location_history[uid]
         if len(history) == 0:
             should_add = True
         else:
@@ -392,7 +384,7 @@ def update_location(data: LocationModel):
                 should_add = dist >= MIN_DIST_IDLE
 
     if should_add:
-        location_history[route_key].append({
+        location_history[uid].append({
             "lat": data.lat,
             "lng": data.lng,
             "timestamp": now,
@@ -510,10 +502,7 @@ def get_locations(room_name: str, viewer_id: str = ""):
 
 @app.get("/get_location_history/{user_id}")
 def get_location_history(user_id: str, period: str = "all"):
-    # Önce deviceId ile ara (isim değişse de rota erişilebilir)
-    device_id = user_to_device.get(user_id)
-    route_key = device_id if device_id and device_id in location_history else user_id
-    history = location_history.get(route_key, [])
+    history = location_history.get(user_id, [])
     if period == "all":
         return history
     now = datetime.now(DEFAULT_TIMEZONE)
@@ -535,10 +524,8 @@ def get_location_history(user_id: str, period: str = "all"):
 
 @app.delete("/clear_history/{user_id}")
 def clear_history(user_id: str):
-    device_id = user_to_device.get(user_id)
-    route_key = device_id if device_id and device_id in location_history else user_id
-    if route_key in location_history:
-        location_history[route_key] = []
+    if user_id in location_history:
+        location_history[user_id] = []
     return {"message": "✅ Geçmiş temizlendi"}
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -688,8 +675,7 @@ def get_room_messages_since(room_name: str, last_id: str = ""):
     for i, msg in enumerate(msgs):
         if msg["id"] == last_id:
             return msgs[i+1:]
-    # last_id bulunamadı — boş döndür (duplicate önleme)
-    return []
+    return msgs[-50:]
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # 👤 KULLANICI ADI DEĞİŞTİRME
@@ -698,384 +684,64 @@ def get_room_messages_since(room_name: str, last_id: str = ""):
 @app.post("/change_username")
 def change_username(data: ChangeUsernameModel):
     old = data.oldName
-    new = data.newName.strip()
-    device_id = data.deviceId
+    new = data.newName
 
-    if not new or len(new) < 1:
+    if not new or len(new.strip()) < 1:
         raise HTTPException(status_code=400, detail="İsim boş olamaz!")
 
-    if old == new:
-        return {"message": "✅ İsim aynı, değişiklik yok"}
-
-    # İsim başka cihaz tarafından kullanılıyorsa engelle
-    if new in locations:
-        existing_device = locations[new].get("deviceId", "")
-        if existing_device != device_id:
-            raise HTTPException(status_code=400, detail="Bu isim zaten kullanımda!")
+    if new in locations and new != old:
+        raise HTTPException(status_code=400, detail="Bu isim zaten kullanımda!")
 
     # Konum verisini taşı
     if old in locations:
         locations[new] = locations.pop(old)
         locations[new]["userId"] = new
 
-    # deviceId ↔ userId eşlemesini güncelle (rota deviceId'ye bağlı kalır)
-    if device_id:
-        device_to_user[device_id] = new
-        user_to_device[new] = device_id
-        if old in user_to_device:
-            del user_to_device[old]
-    else:
-        if old in location_history and new not in location_history:
-            location_history[new] = location_history.pop(old)
+    # Rota geçmişini taşı
+    if old in location_history:
+        location_history[new] = location_history.pop(old)
 
-    # Oda üyeliği + admin yetkisini yeni isme taşı
-    for room_name, room in rooms.items():
-        if room.get("createdBy") == old:
-            rooms[room_name]["createdBy"] = new
-        collectors = room.get("collectors", [])
-        if old in collectors:
-            collectors.remove(old)
-            if new not in collectors:
-                collectors.append(new)
-            rooms[room_name]["collectors"] = collectors
-
-    # Skorları taşı (birleştirerek)
+    # Skorları taşı
     for key in list(scores.keys()):
         if key.endswith(f"_{old}"):
             room = key[:-(len(old)+1)]
-            new_key = f"{room}_{new}"
-            scores[new_key] = scores.get(new_key, 0) + scores.pop(key)
+            scores[f"{room}_{new}"] = scores.pop(key)
 
-    # Pin toplama geçmişini taşı
+    # Pin geçmişini taşı
     for key in list(pin_collection_history.keys()):
         if key.endswith(f"_{old}"):
             room = key[:-(len(old)+1)]
-            new_key = f"{room}_{new}"
-            existing = pin_collection_history.get(new_key, [])
-            pin_collection_history[new_key] = existing + pin_collection_history.pop(key)
+            pin_collection_history[f"{room}_{new}"] = pin_collection_history.pop(key)
 
-    # Aktif pinleri güncelle
-    for pin in pins.values():
-        if pin.get("creator") == old:
-            pin["creator"] = new
-        if pin.get("collectorId") == old:
-            pin["collectorId"] = new
+    # 1-1 Mesajları taşı
+    for key in list(messages.keys()):
+        parts = key.split('_')
+        if old in parts:
+            # Eski konuşmayı al
+            conv = messages.pop(key)
+            # Mesajlardaki from/to alanlarını güncelle
+            for msg in conv:
+                if msg['from'] == old:
+                    msg['from'] = new
+                if msg['to'] == old:
+                    msg['to'] = new
+            # Yeni anahtarla kaydet
+            other = parts[1] if parts[0] == old else parts[0]
+            new_key = '_'.join(sorted([new, other]))
+            # Eğer yeni anahtarda zaten mesaj varsa birleştir
+            if new_key in messages:
+                messages[new_key].extend(conv)
+                messages[new_key].sort(key=lambda m: m.get('timestamp', ''))
+            else:
+                messages[new_key] = conv
+
+    # Grup mesajlarında from alanını güncelle
+    for room_msgs in room_messages.values():
+        for msg in room_msgs:
+            if msg.get('from') == old:
+                msg['from'] = new
 
     return {"message": f"✅ İsim değiştirildi: {old} → {new}"}
-
-
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# 📻 WALKİE-TALKİE SİSTEMİ (BAS KONUŞ)
-# ═══════════════════════════════════════════════════════════════════════════════
-
-room_walkie = {}    # roomName → {id, from, audioBase64, timestamp}
-p2p_walkie = {}     # "user1_user2" → {id, from, audioBase64, timestamp}
-
-class RoomWalkieModel(BaseModel):
-    roomName: str
-    fromUser: str
-    audioBase64: str
-
-class P2pWalkieModel(BaseModel):
-    fromUser: str
-    toUser: str
-    audioBase64: str
-
-@app.post("/room_walkie_send")
-def room_walkie_send(data: RoomWalkieModel):
-    """Odaya walkie ses gönder"""
-    room = data.roomName
-    if room != "Genel" and room not in rooms:
-        raise HTTPException(status_code=404, detail="Oda bulunamadı!")
-    room_walkie[room] = {
-        "id": str(uuid.uuid4())[:8],
-        "from": data.fromUser,
-        "audioBase64": data.audioBase64,
-        "timestamp": get_local_time(),
-    }
-    return {"message": "✅ Walkie gönderildi", "id": room_walkie[room]["id"]}
-
-@app.get("/room_walkie_listen/{room_name}")
-def room_walkie_listen(room_name: str, user_id: str = "", last_id: str = ""):
-    """Odadan walkie ses al — kendinin sesini dışla"""
-    data = room_walkie.get(room_name)
-    if not data:
-        return {"hasAudio": False}
-    # Kendi sesi veya zaten dinlenmiş
-    if data["from"] == user_id or data["id"] == last_id:
-        return {"hasAudio": False}
-    # 10 saniyeden eski sesi gönderme
-    try:
-        ts = datetime.strptime(data["timestamp"], "%Y-%m-%d %H:%M:%S")
-        ts = DEFAULT_TIMEZONE.localize(ts)
-        if (datetime.now(DEFAULT_TIMEZONE) - ts).total_seconds() > 10:
-            return {"hasAudio": False}
-    except:
-        pass
-    return {
-        "hasAudio": True,
-        "id": data["id"],
-        "from": data["from"],
-        "audioBase64": data["audioBase64"],
-    }
-
-@app.post("/walkie_send")
-def walkie_send(data: P2pWalkieModel):
-    """1-1 walkie ses gönder"""
-    key = "_".join(sorted([data.fromUser, data.toUser]))
-    p2p_walkie[key] = {
-        "id": str(uuid.uuid4())[:8],
-        "from": data.fromUser,
-        "to": data.toUser,
-        "audioBase64": data.audioBase64,
-        "timestamp": get_local_time(),
-    }
-    return {"message": "✅ Walkie gönderildi", "id": p2p_walkie[key]["id"]}
-
-@app.get("/walkie_listen/{user_id}/{target}")
-def walkie_listen(user_id: str, target: str, last_id: str = ""):
-    """1-1 walkie ses al"""
-    key = "_".join(sorted([user_id, target]))
-    data = p2p_walkie.get(key)
-    if not data:
-        return {"hasAudio": False}
-    # Kendi sesi veya zaten dinlenmiş
-    if data["from"] == user_id or data["id"] == last_id:
-        return {"hasAudio": False}
-    # 10 saniyeden eski sesi gönderme
-    try:
-        ts = datetime.strptime(data["timestamp"], "%Y-%m-%d %H:%M:%S")
-        ts = DEFAULT_TIMEZONE.localize(ts)
-        if (datetime.now(DEFAULT_TIMEZONE) - ts).total_seconds() > 10:
-            return {"hasAudio": False}
-    except:
-        pass
-    return {
-        "hasAudio": True,
-        "id": data["id"],
-        "from": data["from"],
-        "audioBase64": data["audioBase64"],
-    }
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# 🎤 SES MESAJI SİSTEMİ
-# ═══════════════════════════════════════════════════════════════════════════════
-
-voice_messages = {}       # voiceId → ses verisi (oda grup mesajları için)
-voice_dm_messages = {}    # voiceId → ses verisi (1-1 mesajlar için)
-
-class RoomVoiceModel(BaseModel):
-    roomName: str
-    fromUser: str
-    audioBase64: str
-    durationSeconds: float = 0.0
-
-class VoiceDmModel(BaseModel):
-    fromUser: str
-    toUser: str
-    audioBase64: str
-    durationSeconds: float = 0.0
-
-@app.post("/send_room_voice_message")
-def send_room_voice_message(data: RoomVoiceModel):
-    """Oda grup sesli mesajı gönder"""
-    room = data.roomName
-    if room != "Genel" and room not in rooms:
-        raise HTTPException(status_code=404, detail="Oda bulunamadı!")
-    if room not in room_messages:
-        room_messages[room] = []
-
-    voice_id = str(uuid.uuid4())[:12]
-    voice_messages[voice_id] = {
-        "audioBase64": data.audioBase64,
-        "durationSeconds": data.durationSeconds,
-        "from": data.fromUser,
-        "timestamp": get_local_time(),
-    }
-    room_messages[room].append({
-        "id": str(uuid.uuid4())[:8],
-        "from": data.fromUser,
-        "message": "",
-        "type": "voice",
-        "voiceId": voice_id,
-        "durationSeconds": data.durationSeconds,
-        "timestamp": get_local_time(),
-        "character": locations.get(data.fromUser, {}).get("character", "🧍"),
-    })
-    if len(room_messages[room]) > MAX_ROOM_MESSAGES:
-        room_messages[room] = room_messages[room][-MAX_ROOM_MESSAGES:]
-    return {"message": "✅ Sesli mesaj gönderildi", "voiceId": voice_id}
-
-@app.get("/get_room_voice_message/{voice_id}")
-def get_room_voice_message(voice_id: str):
-    """Oda ses verisini getir"""
-    if voice_id not in voice_messages:
-        raise HTTPException(status_code=404, detail="Ses mesajı bulunamadı!")
-    return voice_messages[voice_id]
-
-@app.post("/send_voice_message")
-def send_voice_message(data: VoiceDmModel):
-    """1-1 sesli mesaj gönder"""
-    key = "_".join(sorted([data.fromUser, data.toUser]))
-    if key not in messages:
-        messages[key] = []
-
-    voice_id = str(uuid.uuid4())[:12]
-    voice_dm_messages[voice_id] = {
-        "audioBase64": data.audioBase64,
-        "durationSeconds": data.durationSeconds,
-        "from": data.fromUser,
-        "timestamp": get_local_time(),
-    }
-    messages[key].append({
-        "from": data.fromUser,
-        "to": data.toUser,
-        "message": "",
-        "type": "voice",
-        "voiceId": voice_id,
-        "durationSeconds": data.durationSeconds,
-        "timestamp": get_local_time(),
-        "read": False,
-    })
-    return {"message": "✅ Sesli mesaj gönderildi", "voiceId": voice_id}
-
-@app.get("/get_voice_message/{voice_id}")
-def get_voice_message(voice_id: str):
-    """1-1 ses verisini getir"""
-    if voice_id not in voice_dm_messages:
-        raise HTTPException(status_code=404, detail="Ses mesajı bulunamadı!")
-    return voice_dm_messages[voice_id]
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# 👑 MASTER ADMİN SİSTEMİ
-# ═══════════════════════════════════════════════════════════════════════════════
-
-MASTER_PASSWORD = "Yürü.0131"
-master_admins = set()  # Aktif master admin cihaz ID'leri
-
-def is_master(device_id: str) -> bool:
-    return device_id in master_admins
-
-@app.post("/master_login")
-def master_login(device_id: str, password: str):
-    if password != MASTER_PASSWORD:
-        raise HTTPException(status_code=403, detail="Yanlış şifre!")
-    master_admins.add(device_id)
-    return {"message": "✅ Master admin girişi başarılı"}
-
-@app.post("/master_logout")
-def master_logout(device_id: str):
-    master_admins.discard(device_id)
-    return {"message": "✅ Çıkış yapıldı"}
-
-@app.get("/master_status")
-def master_status(device_id: str):
-    return {"isMaster": is_master(device_id)}
-
-@app.get("/master_get_all_users")
-def master_get_all_users(device_id: str):
-    if not is_master(device_id):
-        raise HTTPException(status_code=403, detail="Yetkisiz!")
-    result = []
-    for uid, data in locations.items():
-        result.append({
-            "userId": uid,
-            "deviceId": data.get("deviceId", ""),
-            "deviceType": data.get("deviceType", "phone"),
-            "roomName": data.get("roomName", "Genel"),
-            "lastSeen": data.get("lastSeen", ""),
-            "isOnline": is_user_online(data.get("lastSeen", "")),
-            "isMasterAdmin": data.get("deviceId", "") in master_admins,
-        })
-    return result
-
-@app.get("/master_get_all_rooms")
-def master_get_all_rooms(device_id: str):
-    if not is_master(device_id):
-        raise HTTPException(status_code=403, detail="Yetkisiz!")
-    result = [{"name": "Genel", "hasPassword": False, "createdBy": "system",
-               "userCount": sum(1 for u in locations.values() if u.get("roomName") == "Genel" and is_user_online(u.get("lastSeen",""))),
-               "password": None}]
-    for name, room in rooms.items():
-        result.append({
-            "name": name,
-            "hasPassword": True,
-            "password": room["password"],
-            "createdBy": room["createdBy"],
-            "userCount": sum(1 for u in locations.values() if u.get("roomName") == name and is_user_online(u.get("lastSeen",""))),
-        })
-    return result
-
-@app.delete("/master_delete_room/{room_name}")
-def master_delete_room(room_name: str, device_id: str):
-    if not is_master(device_id):
-        raise HTTPException(status_code=403, detail="Yetkisiz!")
-    if room_name not in rooms:
-        raise HTTPException(status_code=404, detail="Oda bulunamadı!")
-    del rooms[room_name]
-    for uid in locations:
-        if locations[uid].get("roomName") == room_name:
-            locations[uid]["roomName"] = "Genel"
-    for pin_id in list(pins.keys()):
-        if pins[pin_id].get("roomName") == room_name:
-            del pins[pin_id]
-    for key in list(scores.keys()):
-        if key.startswith(f"{room_name}_"):
-            del scores[key]
-    if room_name in room_messages:
-        del room_messages[room_name]
-    return {"message": f"✅ {room_name} silindi"}
-
-@app.delete("/master_kick_user/{user_id}")
-def master_kick_user(user_id: str, device_id: str):
-    if not is_master(device_id):
-        raise HTTPException(status_code=403, detail="Yetkisiz!")
-    if user_id in locations:
-        del locations[user_id]
-    if user_id in location_history:
-        del location_history[user_id]
-    if user_id in user_to_device:
-        did = user_to_device.pop(user_id)
-        device_to_user.pop(did, None)
-        master_admins.discard(did)
-    return {"message": f"✅ {user_id} sunucudan atıldı"}
-
-@app.get("/master_get_room_password/{room_name}")
-def master_get_room_password(room_name: str, device_id: str):
-    if not is_master(device_id):
-        raise HTTPException(status_code=403, detail="Yetkisiz!")
-    if room_name not in rooms:
-        raise HTTPException(status_code=404, detail="Oda bulunamadı!")
-    return {"password": rooms[room_name]["password"]}
-
-@app.post("/master_set_collector/{room_name}/{target_user}")
-def master_set_collector(room_name: str, target_user: str, device_id: str, enabled: bool):
-    if not is_master(device_id):
-        raise HTTPException(status_code=403, detail="Yetkisiz!")
-    if room_name not in rooms:
-        raise HTTPException(status_code=404, detail="Oda bulunamadı!")
-    collectors = rooms[room_name].get("collectors", [])
-    if enabled and target_user not in collectors:
-        collectors.append(target_user)
-    elif not enabled and target_user in collectors:
-        collectors.remove(target_user)
-    rooms[room_name]["collectors"] = collectors
-    return {"message": "✅ Yetki güncellendi"}
-
-@app.delete("/master_clear_all")
-def master_clear_all(device_id: str):
-    if not is_master(device_id):
-        raise HTTPException(status_code=403, detail="Yetkisiz!")
-    locations.clear(); location_history.clear(); pins.clear()
-    scores.clear(); pin_collection_history.clear()
-    messages.clear(); room_messages.clear()
-    voice_messages.clear(); voice_dm_messages.clear()
-    room_walkie.clear(); p2p_walkie.clear()
-    rooms.clear()
-    return {"message": "✅ Tüm veriler temizlendi"}
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # 🔧 YÖNETİM FONKSİYONLARI
@@ -1096,8 +762,4 @@ def clear_all():
     pin_collection_history.clear()
     messages.clear()
     room_messages.clear()
-    voice_messages.clear()
-    voice_dm_messages.clear()
-    room_walkie.clear()
-    p2p_walkie.clear()
     return {"message": "✅ Tüm veriler silindi"}
