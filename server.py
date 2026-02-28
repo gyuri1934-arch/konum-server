@@ -782,3 +782,179 @@ def clear_all():
                   "pin_collection_history","messages","room_messages"]:
             cur.execute(f"DELETE FROM {t}")
     return {"message": "✅ Tüm veriler silindi"}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 🎙️ WALKİE-TALKİE & MÜZİK (RAM — geçici ses verisi)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# RAM depolama (ses verisi kalıcı olmak zorunda değil)
+_walkie_p2p   = {}   # "from_to" → {id, audio, timestamp}
+_walkie_room  = {}   # roomName → [{id, from, audio, timestamp}]
+_music_status = {}   # roomName → {broadcaster, title, active}
+_music_chunks = {}   # roomName → [{id, index, data, timestamp}]
+_shared_routes = {}  # roomName → {userId, points, timestamp}
+
+import time as _time
+
+class WalkieSendModel(BaseModel):
+    fromUser: str
+    toUser:   str = ""
+    roomName: str = ""
+    audioBase64: str
+
+class MusicStartModel(BaseModel):
+    roomName:    str
+    broadcaster: str
+    title:       str = ""
+
+class MusicChunkModel(BaseModel):
+    roomName:    str
+    broadcaster: str
+    chunkIndex:  int
+    audioBase64: str
+
+class MusicStopModel(BaseModel):
+    roomName:    str
+    broadcaster: str
+
+class SharedRouteModel(BaseModel):
+    roomName: str
+    userId:   str
+    points:   list
+
+# ── P2P Walkie ────────────────────────────────────────────────────────────────
+
+@app.post("/walkie_send")
+def walkie_send(data: WalkieSendModel):
+    key = "_".join(sorted([data.fromUser, data.toUser]))
+    _walkie_p2p[key] = {
+        "id":        str(uuid.uuid4())[:8],
+        "from":      data.fromUser,
+        "audio":     data.audioBase64,
+        "timestamp": now_str(),
+    }
+    return {"message": "✅ Walkie gönderildi"}
+
+@app.get("/walkie_listen/{user_id}/{target}")
+def walkie_listen(user_id: str, target: str, last_id: str = ""):
+    key = "_".join(sorted([user_id, target]))
+    msg = _walkie_p2p.get(key)
+    if not msg or msg["from"] == user_id or msg["id"] == last_id:
+        return []
+    return [msg]
+
+# ── Oda Walkie ────────────────────────────────────────────────────────────────
+
+@app.post("/room_walkie_send")
+def room_walkie_send(data: WalkieSendModel):
+    room = data.roomName or "Genel"
+    if room not in _walkie_room:
+        _walkie_room[room] = []
+    msg = {
+        "id":        str(uuid.uuid4())[:8],
+        "from":      data.fromUser,
+        "audio":     data.audioBase64,
+        "timestamp": now_str(),
+    }
+    _walkie_room[room].append(msg)
+    # Son 10 mesajı tut
+    _walkie_room[room] = _walkie_room[room][-10:]
+    return {"message": "✅ Oda walkie gönderildi"}
+
+@app.get("/room_walkie_listen/{room_name}")
+def room_walkie_listen(room_name: str, user_id: str = "", last_id: str = ""):
+    msgs = _walkie_room.get(room_name, [])
+    if not last_id:
+        # Son mesajı döndür (kendinden değilse)
+        for msg in reversed(msgs):
+            if msg["from"] != user_id:
+                return [msg]
+        return []
+    # last_id'den sonrakileri döndür
+    result = []
+    found = False
+    for msg in msgs:
+        if found and msg["from"] != user_id:
+            result.append(msg)
+        if msg["id"] == last_id:
+            found = True
+    return result
+
+# ── Müzik Yayını ──────────────────────────────────────────────────────────────
+
+@app.post("/music_start")
+def music_start(data: MusicStartModel):
+    _music_status[data.roomName] = {
+        "broadcaster": data.broadcaster,
+        "title":       data.title,
+        "active":      True,
+        "startTime":   now_str(),
+    }
+    _music_chunks[data.roomName] = []
+    return {"message": "✅ Müzik yayını başladı"}
+
+@app.post("/music_chunk")
+def music_chunk(data: MusicChunkModel):
+    room = data.roomName
+    if room not in _music_chunks:
+        _music_chunks[room] = []
+    chunk_id = str(uuid.uuid4())[:8]
+    _music_chunks[room].append({
+        "id":        chunk_id,
+        "index":     data.chunkIndex,
+        "from":      data.broadcaster,
+        "audio":     data.audioBase64,
+        "timestamp": now_str(),
+    })
+    # Son 20 chunk tut
+    _music_chunks[room] = _music_chunks[room][-20:]
+    return {"message": "✅ Chunk gönderildi", "id": chunk_id}
+
+@app.get("/music_chunk_data/{room_name}/{chunk_id}")
+def music_chunk_data(room_name: str, chunk_id: str):
+    chunks = _music_chunks.get(room_name, [])
+    for chunk in chunks:
+        if chunk["id"] == chunk_id:
+            return chunk
+    raise HTTPException(404, "Chunk bulunamadı")
+
+@app.post("/music_stop")
+def music_stop(data: MusicStopModel):
+    if data.roomName in _music_status:
+        _music_status[data.roomName]["active"] = False
+    _music_chunks.pop(data.roomName, None)
+    return {"message": "✅ Müzik yayını durduruldu"}
+
+@app.get("/music_status/{room_name}")
+def music_status(room_name: str):
+    status = _music_status.get(room_name, {"active": False, "broadcaster": None, "title": ""})
+    chunks = _music_chunks.get(room_name, [])
+    return {
+        "active":      status.get("active", False),
+        "broadcaster": status.get("broadcaster"),
+        "title":       status.get("title", ""),
+        "chunks":      chunks,
+    }
+
+# ── Paylaşılan Rota ───────────────────────────────────────────────────────────
+
+@app.post("/share_route")
+def share_route(data: SharedRouteModel):
+    _shared_routes[data.roomName] = {
+        "userId":    data.userId,
+        "points":    data.points,
+        "timestamp": now_str(),
+    }
+    return {"message": "✅ Rota paylaşıldı"}
+
+@app.get("/get_shared_route/{room_name}")
+def get_shared_route(room_name: str):
+    route = _shared_routes.get(room_name)
+    if not route:
+        return {"active": False, "points": [], "userId": None}
+    return {"active": True, **route}
+
+@app.delete("/clear_shared_route/{room_name}")
+def clear_shared_route(room_name: str):
+    _shared_routes.pop(room_name, None)
+    return {"message": "✅ Paylaşılan rota temizlendi"}
