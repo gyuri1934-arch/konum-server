@@ -85,7 +85,7 @@ def init_db():
         cur.execute("""
             CREATE TABLE IF NOT EXISTS rooms (
                 room_name TEXT PRIMARY KEY, password TEXT, created_by TEXT,
-                created_by_device TEXT DEFAULT '', created_at TEXT, collectors JSONB DEFAULT '[]'
+                created_by_device TEXT DEFAULT '', created_at TEXT, collectors JSONB DEFAULT '[]', music_allowed JSONB DEFAULT '[]'
             )""")
         cur.execute("""
             CREATE TABLE IF NOT EXISTS scores (
@@ -133,6 +133,7 @@ def init_db():
             "ALTER TABLE messages ADD COLUMN IF NOT EXISTS conv_key TEXT",
             "ALTER TABLE messages ADD COLUMN IF NOT EXISTS is_read BOOLEAN DEFAULT FALSE",
             "ALTER TABLE room_messages ADD COLUMN IF NOT EXISTS character TEXT DEFAULT '🧍'",
+            "ALTER TABLE rooms ADD COLUMN IF NOT EXISTS music_allowed JSONB DEFAULT '[]'",
         ]
         for sql in migrations:
             try:
@@ -380,6 +381,67 @@ def set_collector_permission(room_name: str, target_user: str, admin_id: str, en
 # ═══════════════════════════════════════════════════════════════════════════════
 # 👁️ GÖRÜNÜRLİK
 # ═══════════════════════════════════════════════════════════════════════════════
+
+# ── Müzik Yayın Yetkisi ──────────────────────────────────────────────────────
+
+@app.post("/set_music_permission/{room_name}/{target_user}")
+def set_music_permission(room_name: str, target_user: str, admin_id: str, enabled: bool):
+    """Oda admini veya master admin müzik yayın yetkisi verir"""
+    if not is_admin(room_name, admin_id, get_device_id(admin_id)) and admin_id not in _master_devices:
+        # master device kontrolü
+        with db() as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT device_id FROM locations WHERE user_id=%s", (admin_id,))
+            row = cur.fetchone()
+            dev = row["device_id"] if row else ""
+        if dev not in _master_devices:
+            raise HTTPException(403, "Sadece admin veya master yetkilendirebilir!")
+    with db() as conn:
+        cur = conn.cursor()
+        if room_name == "Genel":
+            # Genel odada global music_allowed listesi — rooms'ta "Genel" yok, ayrı sakla
+            # _master_music_allowed RAM listesini kullan
+            if enabled and target_user not in _master_music_allowed:
+                _master_music_allowed.add(target_user)
+            elif not enabled and target_user in _master_music_allowed:
+                _master_music_allowed.discard(target_user)
+            return {"message": "✅ Müzik yetkisi güncellendi"}
+        cur.execute("SELECT music_allowed FROM rooms WHERE room_name=%s", (room_name,))
+        row = cur.fetchone()
+        if not row: raise HTTPException(404, "Oda bulunamadı!")
+        allowed = collectors_list(row["music_allowed"])
+        if enabled and target_user not in allowed: allowed.append(target_user)
+        elif not enabled and target_user in allowed: allowed.remove(target_user)
+        cur.execute("UPDATE rooms SET music_allowed=%s WHERE room_name=%s",
+                    (json.dumps(allowed), room_name))
+    return {"message": "✅ Müzik yetkisi güncellendi", "music_allowed": allowed}
+
+@app.get("/get_music_permission/{room_name}/{user_id}")
+def get_music_permission(room_name: str, user_id: str, device_id: str = ""):
+    """Kullanıcının müzik yayın yetkisi var mı?"""
+    # Master admin her zaman yetkili
+    if device_id in _master_devices: return {"canBroadcast": True, "reason": "master"}
+    with db() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT device_id FROM locations WHERE user_id=%s", (user_id,))
+        row = cur.fetchone()
+        dev = row["device_id"] if row else ""
+    if dev in _master_devices: return {"canBroadcast": True, "reason": "master"}
+    # Oda admini
+    if room_name != "Genel" and is_admin(room_name, user_id, dev):
+        return {"canBroadcast": True, "reason": "admin"}
+    # Genel oda — master music_allowed listesi
+    if room_name == "Genel":
+        return {"canBroadcast": user_id in _master_music_allowed, "reason": "master_allowed"}
+    # Oda music_allowed listesi
+    with db() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT music_allowed, created_by FROM rooms WHERE room_name=%s", (room_name,))
+        row = cur.fetchone()
+        if not row: return {"canBroadcast": False, "reason": "no_room"}
+        if row["created_by"] == user_id: return {"canBroadcast": True, "reason": "admin"}
+        allowed = collectors_list(row["music_allowed"])
+    return {"canBroadcast": user_id in allowed, "reason": "allowed"}
 
 @app.post("/set_visibility")
 def set_visibility(data: VisibilityModel):
@@ -975,8 +1037,9 @@ def clear_shared_route(room_name: str):
 # 👑 MASTER ADMİN SİSTEMİ
 # ═══════════════════════════════════════════════════════════════════════════════
 
-MASTER_PASSWORD = "8862"   # ← Şifreni buradan değiştirebilirsin
+MASTER_PASSWORD = "Yuri2024!"   # ← Şifreni buradan değiştirebilirsin
 _master_devices = set()         # Oturum açmış cihaz ID'leri (RAM)
+_master_music_allowed = set()   # Master'ın müzik yetkisi verdiği kullanıcılar (RAM)
 
 def is_master(device_id: str) -> bool:
     return device_id in _master_devices
@@ -1059,4 +1122,3 @@ def master_clear_all(device_id: str = ""):
                   "pin_collection_history","messages","room_messages"]:
             cur.execute(f"DELETE FROM {t}")
     return {"message": "✅ Tüm veriler silindi"}
-
