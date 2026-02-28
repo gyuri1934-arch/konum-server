@@ -61,122 +61,64 @@ def db():
 def init_db():
     with db() as conn:
         cur = conn.cursor()
+
+        # ── 1. Tabloları oluştur (yoksa) ─────────────────────────────────────
         cur.execute("""
             CREATE TABLE IF NOT EXISTS locations (
-                user_id TEXT PRIMARY KEY,
-                device_id TEXT DEFAULT '',
-                device_type TEXT DEFAULT 'phone',
-                lat DOUBLE PRECISION,
-                lng DOUBLE PRECISION,
-                altitude DOUBLE PRECISION DEFAULT 0,
-                speed DOUBLE PRECISION DEFAULT 0,
-                animation_type TEXT DEFAULT 'pulse',
-                room_name TEXT DEFAULT 'Genel',
-                character TEXT DEFAULT '🧍',
-                last_seen TEXT,
-                idle_status TEXT DEFAULT 'online',
-                idle_minutes INT DEFAULT 0,
-                idle_start TEXT
+                user_id TEXT PRIMARY KEY, device_id TEXT DEFAULT '',
+                device_type TEXT DEFAULT 'phone', lat DOUBLE PRECISION, lng DOUBLE PRECISION,
+                altitude DOUBLE PRECISION DEFAULT 0, speed DOUBLE PRECISION DEFAULT 0,
+                animation_type TEXT DEFAULT 'pulse', room_name TEXT DEFAULT 'Genel',
+                character TEXT DEFAULT '🧍', last_seen TEXT,
+                idle_status TEXT DEFAULT 'online', idle_minutes INT DEFAULT 0, idle_start TEXT
             )""")
         cur.execute("""
             CREATE TABLE IF NOT EXISTS location_history (
-                id SERIAL PRIMARY KEY,
-                user_id TEXT NOT NULL,
-                lat DOUBLE PRECISION,
-                lng DOUBLE PRECISION,
-                timestamp TEXT,
-                speed DOUBLE PRECISION DEFAULT 0
+                id SERIAL PRIMARY KEY, user_id TEXT NOT NULL,
+                lat DOUBLE PRECISION, lng DOUBLE PRECISION,
+                timestamp TEXT, speed DOUBLE PRECISION DEFAULT 0
             )""")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_lh_user ON location_history(user_id)")
-        # timestamp kolonu varsa index oluştur
-        cur.execute("""
-            DO $$ BEGIN
-                IF EXISTS (SELECT 1 FROM information_schema.columns
-                           WHERE table_name='location_history' AND column_name='timestamp') THEN
-                    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname='idx_lh_ts') THEN
-                        CREATE INDEX idx_lh_ts ON location_history(timestamp);
-                    END IF;
-                END IF;
-            END $$
-        """)
         cur.execute("""
             CREATE TABLE IF NOT EXISTS device_registry (
-                device_id TEXT PRIMARY KEY,
-                user_id   TEXT NOT NULL
+                device_id TEXT PRIMARY KEY, user_id TEXT NOT NULL
             )""")
         cur.execute("""
             CREATE TABLE IF NOT EXISTS rooms (
-                room_name         TEXT PRIMARY KEY,
-                password          TEXT,
-                created_by        TEXT,
-                created_by_device TEXT DEFAULT '',
-                created_at        TEXT,
-                collectors        JSONB DEFAULT '[]'
+                room_name TEXT PRIMARY KEY, password TEXT, created_by TEXT,
+                created_by_device TEXT DEFAULT '', created_at TEXT, collectors JSONB DEFAULT '[]'
             )""")
         cur.execute("""
             CREATE TABLE IF NOT EXISTS scores (
-                room_name TEXT,
-                user_id   TEXT,
-                score     INT DEFAULT 0,
+                room_name TEXT, user_id TEXT, score INT DEFAULT 0,
                 PRIMARY KEY (room_name, user_id)
             )""")
         cur.execute("""
             CREATE TABLE IF NOT EXISTS pin_collection_history (
-                id         SERIAL PRIMARY KEY,
-                room_name  TEXT,
-                user_id    TEXT,
-                timestamp  TEXT,
-                created_at TEXT,
-                creator    TEXT,
-                lat        DOUBLE PRECISION,
-                lng        DOUBLE PRECISION
+                id SERIAL PRIMARY KEY, room_name TEXT, user_id TEXT, timestamp TEXT,
+                created_at TEXT, creator TEXT, lat DOUBLE PRECISION, lng DOUBLE PRECISION
             )""")
         cur.execute("""
             CREATE TABLE IF NOT EXISTS pins (
-                id               TEXT PRIMARY KEY,
-                room_name        TEXT,
-                creator          TEXT,
-                lat              DOUBLE PRECISION,
-                lng              DOUBLE PRECISION,
-                created_at       TEXT,
-                collector_id     TEXT,
-                collection_start TEXT,
-                collection_time  INT DEFAULT 0
+                id TEXT PRIMARY KEY, room_name TEXT, creator TEXT,
+                lat DOUBLE PRECISION, lng DOUBLE PRECISION, created_at TEXT,
+                collector_id TEXT, collection_start TEXT, collection_time INT DEFAULT 0
             )""")
         cur.execute("""
             CREATE TABLE IF NOT EXISTS messages (
-                id        SERIAL PRIMARY KEY,
-                from_user TEXT,
-                to_user   TEXT,
-                conv_key  TEXT,
-                message   TEXT,
-                timestamp TEXT,
-                is_read   BOOLEAN DEFAULT FALSE
+                id SERIAL PRIMARY KEY, from_user TEXT, to_user TEXT,
+                conv_key TEXT, message TEXT, timestamp TEXT, is_read BOOLEAN DEFAULT FALSE
             )""")
-        try:
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_msg_key ON messages(conv_key)")
-        except Exception:
-            pass
         cur.execute("""
             CREATE TABLE IF NOT EXISTS room_messages (
-                id        TEXT PRIMARY KEY,
-                room_name TEXT,
-                from_user TEXT,
-                message   TEXT,
-                timestamp TEXT,
-                character TEXT DEFAULT '🧍'
+                id TEXT PRIMARY KEY, room_name TEXT, from_user TEXT,
+                message TEXT, timestamp TEXT, character TEXT DEFAULT '🧍'
             )""")
-        try:
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_rm_room ON room_messages(room_name)")
-        except Exception:
-            pass
         cur.execute("""
             CREATE TABLE IF NOT EXISTS visibility_settings (
-                user_id TEXT PRIMARY KEY,
-                mode    TEXT DEFAULT 'all',
-                allowed JSONB DEFAULT '[]'
+                user_id TEXT PRIMARY KEY, mode TEXT DEFAULT 'all', allowed JSONB DEFAULT '[]'
             )""")
-        # ── Migration: eksik kolonları güvenle ekle ─────────────────────────
+
+        # ── 2. Migration: eski tablolara eksik kolonları ekle ─────────────────
         migrations = [
             "ALTER TABLE location_history ADD COLUMN IF NOT EXISTS timestamp TEXT",
             "ALTER TABLE location_history ADD COLUMN IF NOT EXISTS speed DOUBLE PRECISION DEFAULT 0",
@@ -185,6 +127,7 @@ def init_db():
             "ALTER TABLE locations ADD COLUMN IF NOT EXISTS idle_status TEXT DEFAULT 'online'",
             "ALTER TABLE locations ADD COLUMN IF NOT EXISTS character TEXT DEFAULT '🧍'",
             "ALTER TABLE locations ADD COLUMN IF NOT EXISTS animation_type TEXT DEFAULT 'pulse'",
+            "ALTER TABLE locations ADD COLUMN IF NOT EXISTS device_id TEXT DEFAULT ''",
             "ALTER TABLE rooms ADD COLUMN IF NOT EXISTS created_by_device TEXT DEFAULT ''",
             "ALTER TABLE rooms ADD COLUMN IF NOT EXISTS collectors JSONB DEFAULT '[]'",
             "ALTER TABLE messages ADD COLUMN IF NOT EXISTS conv_key TEXT",
@@ -194,8 +137,8 @@ def init_db():
         for sql in migrations:
             try:
                 cur.execute(sql)
-            except Exception as e:
-                print(f"Migration skip: {e}")
+            except Exception as ex:
+                print(f"Migration skip: {ex}")
 
         # conv_key boş olanları doldur
         try:
@@ -205,10 +148,20 @@ def init_db():
                     FROM unnest(ARRAY[from_user, to_user]) u
                 ) WHERE conv_key IS NULL OR conv_key = ''
             """)
-        except Exception as e:
-            print(f"conv_key migration skip: {e}")
+        except Exception as ex:
+            print(f"conv_key skip: {ex}")
 
-    print("✅ DB tabloları hazır")
+        # ── 3. Index'leri oluştur (migration sonrası) ────────────────────────
+        for idx_sql in [
+            "CREATE INDEX IF NOT EXISTS idx_lh_user ON location_history(user_id)",
+            "CREATE INDEX IF NOT EXISTS idx_lh_ts   ON location_history(timestamp)",
+            "CREATE INDEX IF NOT EXISTS idx_msg_key ON messages(conv_key)",
+            "CREATE INDEX IF NOT EXISTS idx_rm_room ON room_messages(room_name)",
+        ]:
+            try:
+                cur.execute(idx_sql)
+            except Exception as ex:
+                print(f"Index skip: {ex}")
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # 🛠️ YARDIMCILAR
