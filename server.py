@@ -108,6 +108,13 @@ def init_db():
             "ALTER TABLE locations ADD COLUMN IF NOT EXISTS character TEXT DEFAULT '🧍'",
             "ALTER TABLE locations ADD COLUMN IF NOT EXISTS animation_type TEXT DEFAULT 'pulse'",
             "ALTER TABLE locations ADD COLUMN IF NOT EXISTS device_id TEXT DEFAULT ''",
+            "ALTER TABLE locations ADD COLUMN IF NOT EXISTS room_name TEXT DEFAULT 'Genel'",
+            "ALTER TABLE locations ADD COLUMN IF NOT EXISTS lat DOUBLE PRECISION DEFAULT 0",
+            "ALTER TABLE locations ADD COLUMN IF NOT EXISTS lng DOUBLE PRECISION DEFAULT 0",
+            "ALTER TABLE locations ADD COLUMN IF NOT EXISTS altitude DOUBLE PRECISION DEFAULT 0",
+            "ALTER TABLE locations ADD COLUMN IF NOT EXISTS speed DOUBLE PRECISION DEFAULT 0",
+            "ALTER TABLE locations ADD COLUMN IF NOT EXISTS last_seen TEXT",
+            "ALTER TABLE locations ADD COLUMN IF NOT EXISTS device_type TEXT DEFAULT 'phone'",
             "ALTER TABLE rooms ADD COLUMN IF NOT EXISTS created_by_device TEXT DEFAULT ''",
             "ALTER TABLE rooms ADD COLUMN IF NOT EXISTS collectors JSONB DEFAULT '[]'",
             "ALTER TABLE rooms ADD COLUMN IF NOT EXISTS music_allowed JSONB DEFAULT '[]'",
@@ -687,12 +694,19 @@ def change_username(data: ChangeUsernameModel):
 # ═══════════════════════════════════════════════════════════════════
 _perm_requests = {}  # RAM
 
+class PermRequestModel(BaseModel):
+    roomName: str; requesterUserId: str
+    permissionType: str = ""; type: str = ""
+    message: str = ""; note: str = ""
+
 @app.post("/request_permission")
-def request_permission(roomName: str, requesterUserId: str, type: str, note: str = ""):
+def request_permission(data: PermRequestModel):
     req_id = str(uuid.uuid4())[:8]
-    key = f"{roomName}"
-    if key not in _perm_requests: _perm_requests[key] = []
-    _perm_requests[key].append({"id":req_id,"requester":requesterUserId,"type":type,"note":note,"time":now_str()})
+    ptype = data.permissionType or data.type
+    if data.roomName not in _perm_requests: _perm_requests[data.roomName] = []
+    _perm_requests[data.roomName].append({
+        "id":req_id,"requester":data.requesterUserId,
+        "type":ptype,"note":data.message or data.note,"time":now_str()})
     return {"message":"✅ İstek gönderildi","requestId":req_id}
 
 @app.get("/get_permission_requests/{room_name}")
