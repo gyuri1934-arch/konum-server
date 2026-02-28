@@ -153,7 +153,10 @@ def init_db():
                 timestamp TEXT,
                 is_read   BOOLEAN DEFAULT FALSE
             )""")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_msg_key ON messages(conv_key)")
+        try:
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_msg_key ON messages(conv_key)")
+        except Exception:
+            pass
         cur.execute("""
             CREATE TABLE IF NOT EXISTS room_messages (
                 id        TEXT PRIMARY KEY,
@@ -163,7 +166,10 @@ def init_db():
                 timestamp TEXT,
                 character TEXT DEFAULT '🧍'
             )""")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_rm_room ON room_messages(room_name)")
+        try:
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_rm_room ON room_messages(room_name)")
+        except Exception:
+            pass
         cur.execute("""
             CREATE TABLE IF NOT EXISTS visibility_settings (
                 user_id TEXT PRIMARY KEY,
