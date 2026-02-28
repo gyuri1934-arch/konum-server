@@ -88,7 +88,17 @@ def init_db():
                 speed DOUBLE PRECISION DEFAULT 0
             )""")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_lh_user ON location_history(user_id)")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_lh_ts   ON location_history(timestamp)")
+        # timestamp kolonu varsa index oluştur
+        cur.execute("""
+            DO $$ BEGIN
+                IF EXISTS (SELECT 1 FROM information_schema.columns
+                           WHERE table_name='location_history' AND column_name='timestamp') THEN
+                    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname='idx_lh_ts') THEN
+                        CREATE INDEX idx_lh_ts ON location_history(timestamp);
+                    END IF;
+                END IF;
+            END $$
+        """)
         cur.execute("""
             CREATE TABLE IF NOT EXISTS device_registry (
                 device_id TEXT PRIMARY KEY,
@@ -160,6 +170,38 @@ def init_db():
                 mode    TEXT DEFAULT 'all',
                 allowed JSONB DEFAULT '[]'
             )""")
+        # ── Migration: eksik kolonları güvenle ekle ─────────────────────────
+        migrations = [
+            "ALTER TABLE location_history ADD COLUMN IF NOT EXISTS timestamp TEXT",
+            "ALTER TABLE location_history ADD COLUMN IF NOT EXISTS speed DOUBLE PRECISION DEFAULT 0",
+            "ALTER TABLE locations ADD COLUMN IF NOT EXISTS idle_start TEXT",
+            "ALTER TABLE locations ADD COLUMN IF NOT EXISTS idle_minutes INT DEFAULT 0",
+            "ALTER TABLE locations ADD COLUMN IF NOT EXISTS idle_status TEXT DEFAULT 'online'",
+            "ALTER TABLE locations ADD COLUMN IF NOT EXISTS character TEXT DEFAULT '🧍'",
+            "ALTER TABLE locations ADD COLUMN IF NOT EXISTS animation_type TEXT DEFAULT 'pulse'",
+            "ALTER TABLE rooms ADD COLUMN IF NOT EXISTS created_by_device TEXT DEFAULT ''",
+            "ALTER TABLE rooms ADD COLUMN IF NOT EXISTS collectors JSONB DEFAULT '[]'",
+            "ALTER TABLE messages ADD COLUMN IF NOT EXISTS conv_key TEXT",
+            "ALTER TABLE messages ADD COLUMN IF NOT EXISTS is_read BOOLEAN DEFAULT FALSE",
+            "ALTER TABLE room_messages ADD COLUMN IF NOT EXISTS character TEXT DEFAULT '🧍'",
+        ]
+        for sql in migrations:
+            try:
+                cur.execute(sql)
+            except Exception as e:
+                print(f"Migration skip: {e}")
+
+        # conv_key boş olanları doldur
+        try:
+            cur.execute("""
+                UPDATE messages SET conv_key = (
+                    SELECT string_agg(u, '_' ORDER BY u)
+                    FROM unnest(ARRAY[from_user, to_user]) u
+                ) WHERE conv_key IS NULL OR conv_key = ''
+            """)
+        except Exception as e:
+            print(f"conv_key migration skip: {e}")
+
     print("✅ DB tabloları hazır")
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -974,7 +1016,7 @@ def clear_shared_route(room_name: str):
 # 👑 MASTER ADMİN SİSTEMİ
 # ═══════════════════════════════════════════════════════════════════════════════
 
-MASTER_PASSWORD = "Yürü!2025"   # ← Şifreni buradan değiştirebilirsin
+MASTER_PASSWORD = "Yuri2024!"   # ← Şifreni buradan değiştirebilirsin
 _master_devices = set()         # Oturum açmış cihaz ID'leri (RAM)
 
 def is_master(device_id: str) -> bool:
