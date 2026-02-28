@@ -1,971 +1,765 @@
-import os, uuid, json, pytz, psycopg2, psycopg2.extras
+# ═══════════════════════════════════════════════════════════════════════════════
+#                         KONUM TAKİP SERVER
+# ═══════════════════════════════════════════════════════════════════════════════
+# FastAPI server - Konum, pin, mesajlaşma, oda sistemi
+# Versiyon: 2.1 (Grup Mesajlaşma + Emoji Karakter + Akıllı Zamanlama)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 📦 KÜTÜPHANE İMPORTLARI
+# ═══════════════════════════════════════════════════════════════════════════════
+
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import List
+from typing import Optional, List
 from datetime import datetime, timedelta
 from math import radians, sin, cos, sqrt, atan2
-from contextlib import contextmanager
+import pytz
+import uuid
 
-# ═══════════════════════════════════════════════════════════════════
-# ⚙️ CONFIG
-# ═══════════════════════════════════════════════════════════════════
-DATABASE_URL = os.environ.get(
-    "DATABASE_URL",
-    "postgresql://konum_db_user:kmiKUjdHgVeOmw8LNiXs2i4umi7dHBXH@dpg-d6bempl6ubrc73cicdi0-a.frankfurt-postgres.render.com/konum_db"
+# ═══════════════════════════════════════════════════════════════════════════════
+# ⚙️ UYGULAMA BAŞLATMA
+# ═══════════════════════════════════════════════════════════════════════════════
+
+app = FastAPI(title="Konum Takip API", version="2.1")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
-TZ              = pytz.timezone("Europe/Istanbul")
-USER_TIMEOUT    = 300   # saniye
-IDLE_THRESHOLD  = 15    # metre
-IDLE_MINUTES    = 15    # dakika
-SPEED_VEHICLE   = 30    # km/h
-SPEED_WALK      = 3
-MIN_DIST_VEH    = 50    # metre
-MIN_DIST_RUN    = 20
-MIN_DIST_WALK   = 10
-MIN_DIST_IDLE   = 5
-MAX_POINTS      = 5000
-PIN_START       = 20    # metre
-PIN_END         = 25
-MAX_ROOM_MSG    = 200
 
-app = FastAPI(title="Konum API", version="3.1")
-app.add_middleware(CORSMiddleware, allow_origins=["*"],
-                   allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+# ═══════════════════════════════════════════════════════════════════════════════
+# 💾 VERİ SAKLAMASI (RAM)
+# ═══════════════════════════════════════════════════════════════════════════════
 
-# RAM (geçici ses/müzik verileri)
-_master_devices       = set()
-_master_music_allowed = set()
-_walkie_p2p   = {}
-_walkie_room  = {}
-_music_status = {}
-_music_chunks = {}
-_shared_routes = {}
+locations = {}            # userId → konum verisi
+location_history = {}     # userId → rota geçmişi listesi
+rooms = {}                # roomName → oda bilgisi
+scores = {}               # "roomName_userId" → skor
+pin_collection_history = {}  # "roomName_userId" → toplama geçmişi
+pins = {}                 # pinId → pin verisi
+messages = {}             # "fromUser_toUser" → mesaj listesi (1-1)
+room_messages = {}        # roomName → grup mesaj listesi (GRUP)
+visibility_settings = {}  # userId → görünürlük ayarı
 
-# ═══════════════════════════════════════════════════════════════════
-# 🗄️ VERİTABANI
-# ═══════════════════════════════════════════════════════════════════
-@contextmanager
-def db():
-    conn = psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
-    try:
-        yield conn
-        conn.commit()
-    except:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
+# ═══════════════════════════════════════════════════════════════════════════════
+# 🎛️ SİSTEM AYARLARI
+# ═══════════════════════════════════════════════════════════════════════════════
 
-def init_db():
-    with db() as conn:
-        cur = conn.cursor()
-        cur.execute("""CREATE TABLE IF NOT EXISTS locations (
-            user_id TEXT PRIMARY KEY, device_id TEXT DEFAULT '',
-            device_type TEXT DEFAULT 'phone', lat DOUBLE PRECISION DEFAULT 0,
-            lng DOUBLE PRECISION DEFAULT 0, altitude DOUBLE PRECISION DEFAULT 0,
-            speed DOUBLE PRECISION DEFAULT 0, animation_type TEXT DEFAULT 'pulse',
-            room_name TEXT DEFAULT 'Genel', character TEXT DEFAULT '🧍',
-            last_seen TEXT, idle_status TEXT DEFAULT 'online',
-            idle_minutes INT DEFAULT 0, idle_start TEXT)""")
-        cur.execute("""CREATE TABLE IF NOT EXISTS location_history (
-            id SERIAL PRIMARY KEY, user_id TEXT NOT NULL,
-            lat DOUBLE PRECISION, lng DOUBLE PRECISION,
-            timestamp TEXT, speed DOUBLE PRECISION DEFAULT 0)""")
-        cur.execute("""CREATE TABLE IF NOT EXISTS device_registry (
-            device_id TEXT PRIMARY KEY, user_id TEXT NOT NULL)""")
-        cur.execute("""CREATE TABLE IF NOT EXISTS rooms (
-            room_name TEXT PRIMARY KEY, password TEXT, created_by TEXT,
-            created_by_device TEXT DEFAULT '', created_at TEXT,
-            collectors JSONB DEFAULT '[]', music_allowed JSONB DEFAULT '[]')""")
-        cur.execute("""CREATE TABLE IF NOT EXISTS scores (
-            room_name TEXT, user_id TEXT, score INT DEFAULT 0,
-            PRIMARY KEY (room_name, user_id))""")
-        cur.execute("""CREATE TABLE IF NOT EXISTS pin_collection_history (
-            id SERIAL PRIMARY KEY, room_name TEXT, user_id TEXT,
-            timestamp TEXT, created_at TEXT, creator TEXT,
-            lat DOUBLE PRECISION, lng DOUBLE PRECISION)""")
-        cur.execute("""CREATE TABLE IF NOT EXISTS pins (
-            id TEXT PRIMARY KEY, room_name TEXT, creator TEXT,
-            lat DOUBLE PRECISION, lng DOUBLE PRECISION, created_at TEXT,
-            collector_id TEXT, collection_start TEXT, collection_time INT DEFAULT 0)""")
-        cur.execute("""CREATE TABLE IF NOT EXISTS messages (
-            id SERIAL PRIMARY KEY, from_user TEXT, to_user TEXT,
-            conv_key TEXT, message TEXT, timestamp TEXT, is_read BOOLEAN DEFAULT FALSE)""")
-        cur.execute("""CREATE TABLE IF NOT EXISTS room_messages (
-            id TEXT PRIMARY KEY, room_name TEXT, from_user TEXT,
-            message TEXT, timestamp TEXT, character TEXT DEFAULT '🧍')""")
-        cur.execute("""CREATE TABLE IF NOT EXISTS visibility_settings (
-            user_id TEXT PRIMARY KEY, mode TEXT DEFAULT 'all',
-            allowed JSONB DEFAULT '[]')""")
-        # Migration: eksik kolonlar
-        safe = [
-            "ALTER TABLE location_history ADD COLUMN IF NOT EXISTS timestamp TEXT",
-            "ALTER TABLE location_history ADD COLUMN IF NOT EXISTS speed DOUBLE PRECISION DEFAULT 0",
-            "ALTER TABLE locations ADD COLUMN IF NOT EXISTS idle_start TEXT",
-            "ALTER TABLE locations ADD COLUMN IF NOT EXISTS idle_minutes INT DEFAULT 0",
-            "ALTER TABLE locations ADD COLUMN IF NOT EXISTS idle_status TEXT DEFAULT 'online'",
-            "ALTER TABLE locations ADD COLUMN IF NOT EXISTS character TEXT DEFAULT '🧍'",
-            "ALTER TABLE locations ADD COLUMN IF NOT EXISTS animation_type TEXT DEFAULT 'pulse'",
-            "ALTER TABLE locations ADD COLUMN IF NOT EXISTS device_id TEXT DEFAULT ''",
-            "ALTER TABLE locations ADD COLUMN IF NOT EXISTS room_name TEXT DEFAULT 'Genel'",
-            "ALTER TABLE locations ADD COLUMN IF NOT EXISTS lat DOUBLE PRECISION DEFAULT 0",
-            "ALTER TABLE locations ADD COLUMN IF NOT EXISTS lng DOUBLE PRECISION DEFAULT 0",
-            "ALTER TABLE locations ADD COLUMN IF NOT EXISTS altitude DOUBLE PRECISION DEFAULT 0",
-            "ALTER TABLE locations ADD COLUMN IF NOT EXISTS speed DOUBLE PRECISION DEFAULT 0",
-            "ALTER TABLE locations ADD COLUMN IF NOT EXISTS last_seen TEXT",
-            "ALTER TABLE locations ADD COLUMN IF NOT EXISTS device_type TEXT DEFAULT 'phone'",
-            "ALTER TABLE rooms ADD COLUMN IF NOT EXISTS created_by_device TEXT DEFAULT ''",
-            "ALTER TABLE rooms ADD COLUMN IF NOT EXISTS collectors JSONB DEFAULT '[]'",
-            "ALTER TABLE rooms ADD COLUMN IF NOT EXISTS music_allowed JSONB DEFAULT '[]'",
-            "ALTER TABLE messages ADD COLUMN IF NOT EXISTS conv_key TEXT",
-            "ALTER TABLE messages ADD COLUMN IF NOT EXISTS is_read BOOLEAN DEFAULT FALSE",
-            "ALTER TABLE room_messages ADD COLUMN IF NOT EXISTS character TEXT DEFAULT '🧍'",
-        ]
-        for sql in safe:
-            try: cur.execute(sql)
-            except Exception as e: print(f"Migration skip: {e}")
-        # conv_key doldur
-        try:
-            cur.execute("""UPDATE messages SET conv_key=(
-                SELECT string_agg(u,'_' ORDER BY u) FROM unnest(ARRAY[from_user,to_user]) u)
-                WHERE conv_key IS NULL OR conv_key=''""")
-        except: pass
-        # Index'ler
-        for s in ["CREATE INDEX IF NOT EXISTS idx_lh_user ON location_history(user_id)",
-                  "CREATE INDEX IF NOT EXISTS idx_msg_key ON messages(conv_key)",
-                  "CREATE INDEX IF NOT EXISTS idx_rm_room ON room_messages(room_name)"]:
-            try: cur.execute(s)
-            except: pass
-    print("✅ DB hazır")
+DEFAULT_TIMEZONE = pytz.timezone('Europe/Istanbul')
+USER_TIMEOUT = 120          # Kullanıcı timeout (saniye)
+IDLE_THRESHOLD = 15         # Hareketsizlik eşiği (metre)
+IDLE_TIME_MINUTES = 15      # Hareketsizlik süresi (dakika)
 
-@app.on_event("startup")
-def startup(): init_db()
+# Hız eşikleri (km/h)
+SPEED_VEHICLE = 30
+SPEED_RUN = 15
+SPEED_WALK = 3
 
-# ═══════════════════════════════════════════════════════════════════
-# 🛠️ YARDIMCILAR
-# ═══════════════════════════════════════════════════════════════════
-def now_str(): return datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S")
+# Rota örnekleme mesafeleri (metre)
+MIN_DIST_VEHICLE = 50
+MIN_DIST_RUN = 20
+MIN_DIST_WALK = 10
+MIN_DIST_IDLE = 5
+
+# Rota limitleri
+MAX_POINTS_PER_USER = 5000
+MAX_HISTORY_DAYS = 90
+
+# Pin toplama mesafeleri (metre)
+PIN_COLLECT_START = 20
+PIN_COLLECT_END = 25
+
+# Grup mesaj limiti
+MAX_ROOM_MESSAGES = 200
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 🛠️ YARDIMCI FONKSİYONLAR
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def get_local_time():
+    return datetime.now(DEFAULT_TIMEZONE).strftime("%Y-%m-%d %H:%M:%S")
 
 def haversine(lat1, lng1, lat2, lng2):
     R = 6371000
-    dlat, dlng = radians(lat2-lat1), radians(lng2-lng1)
-    a = sin(dlat/2)**2 + cos(radians(lat1))*cos(radians(lat2))*sin(dlng/2)**2
+    dlat = radians(lat2 - lat1)
+    dlng = radians(lng2 - lng1)
+    a = sin(dlat/2)**2 + cos(radians(lat1)) * cos(radians(lat2)) * sin(dlng/2)**2
     return R * 2 * atan2(sqrt(a), sqrt(1-a))
 
-def is_online(last_seen):
-    if not last_seen: return False
+def is_user_online(last_seen_str):
     try:
-        dt = TZ.localize(datetime.strptime(last_seen, "%Y-%m-%d %H:%M:%S"))
-        return (datetime.now(TZ) - dt).total_seconds() < USER_TIMEOUT
-    except: return False
+        last_seen = datetime.strptime(last_seen_str, "%Y-%m-%d %H:%M:%S")
+        last_seen = DEFAULT_TIMEZONE.localize(last_seen)
+        now = datetime.now(DEFAULT_TIMEZONE)
+        return (now - last_seen).total_seconds() < USER_TIMEOUT
+    except:
+        return False
 
-def clist(val):
-    if isinstance(val, list): return val
-    try: return json.loads(val or "[]")
-    except: return []
+def cleanup_old_routes():
+    cutoff = datetime.now(DEFAULT_TIMEZONE) - timedelta(days=MAX_HISTORY_DAYS)
+    for uid in list(location_history.keys()):
+        history = location_history[uid]
+        history[:] = [
+            p for p in history
+            if datetime.strptime(p["timestamp"], "%Y-%m-%d %H:%M:%S").replace(
+                tzinfo=DEFAULT_TIMEZONE) > cutoff
+        ]
+        if len(history) > MAX_POINTS_PER_USER:
+            location_history[uid] = history[-MAX_POINTS_PER_USER:]
 
-def ckey(u1, u2): return "_".join(sorted([u1, u2]))
+# ═══════════════════════════════════════════════════════════════════════════════
+# 📋 VERİ MODELLERİ
+# ═══════════════════════════════════════════════════════════════════════════════
 
-# ═══════════════════════════════════════════════════════════════════
-# 📋 MODELLER
-# ═══════════════════════════════════════════════════════════════════
 class LocationModel(BaseModel):
-    userId: str; deviceId: str = ""; deviceType: str = "phone"
-    lat: float; lng: float; altitude: float = 0; speed: float = 0
-    animationType: str = "pulse"; roomName: str = "Genel"; character: str = "🧍"
+    userId: str
+    deviceId: str = ""
+    deviceType: str = "phone"
+    lat: float
+    lng: float
+    altitude: float = 0
+    speed: float = 0
+    animationType: str = "pulse"
+    roomName: str = "Genel"
+    character: str = "🧍"
 
 class RoomModel(BaseModel):
-    roomName: str; password: str; createdBy: str; createdByDevice: str = ""
+    roomName: str
+    password: str
+    createdBy: str
 
 class JoinRoomModel(BaseModel):
-    roomName: str; password: str
+    roomName: str
+    password: str
 
 class PinModel(BaseModel):
-    roomName: str; creator: str; lat: float; lng: float
+    roomName: str
+    creator: str
+    lat: float
+    lng: float
 
 class MessageModel(BaseModel):
-    fromUser: str; toUser: str; message: str
+    fromUser: str
+    toUser: str
+    message: str
 
 class RoomMessageModel(BaseModel):
-    roomName: str; fromUser: str; message: str
+    roomName: str
+    fromUser: str
+    message: str
 
 class VisibilityModel(BaseModel):
-    userId: str; mode: str; allowed: List[str] = []
+    userId: str
+    mode: str
+    allowed: List[str] = []
 
 class ChangeUsernameModel(BaseModel):
-    deviceId: str; oldName: str; newName: str
+    deviceId: str
+    oldName: str
+    newName: str
 
-class WalkieSendModel(BaseModel):
-    fromUser: str; toUser: str = ""; roomName: str = ""; audioBase64: str
+# ═══════════════════════════════════════════════════════════════════════════════
+# 🏠 ANA SAYFA VE SAĞLIK KONTROLÜ
+# ═══════════════════════════════════════════════════════════════════════════════
 
-class MusicStartModel(BaseModel):
-    roomName: str; broadcaster: str; title: str = ""
-
-class MusicChunkModel(BaseModel):
-    roomName: str; broadcaster: str; chunkIndex: int; audioBase64: str
-
-class MusicStopModel(BaseModel):
-    roomName: str; broadcaster: str
-
-class SharedRouteModel(BaseModel):
-    roomName: str; userId: str; points: list
-
-# ═══════════════════════════════════════════════════════════════════
-# 🏠 ANASAYFA
-# ═══════════════════════════════════════════════════════════════════
 @app.get("/")
 def root():
-    with db() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT COUNT(*) as c FROM locations WHERE last_seen IS NOT NULL")
-        total = cur.fetchone()["c"]
-    return {"status": "✅ Çalışıyor", "time": now_str(), "total_users": total}
+    online_count = sum(1 for u in locations.values()
+                      if is_user_online(u.get("lastSeen", "")))
+    return {
+        "status": "✅ Server çalışıyor",
+        "time": get_local_time(),
+        "online_users": online_count,
+        "total_rooms": len(rooms),
+        "total_pins": len(pins),
+    }
 
 @app.get("/health")
-def health(): return {"status": "ok", "time": now_str()}
+def health():
+    return {"status": "ok", "time": get_local_time()}
 
-@app.get("/debug_locations")
-def debug_locations():
-    with db() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT user_id, room_name, last_seen, lat, lng FROM locations ORDER BY last_seen DESC")
-        rows = cur.fetchall()
-    now = datetime.now(TZ)
-    result = []
-    for r in rows:
-        try:
-            dt = TZ.localize(datetime.strptime(r["last_seen"], "%Y-%m-%d %H:%M:%S"))
-            age = int((now - dt).total_seconds())
-            online = age < USER_TIMEOUT
-        except:
-            age = -1; online = False
-        result.append({"userId": r["user_id"], "room": r["room_name"],
-                        "lastSeen": r["last_seen"], "ageSec": age, "online": online,
-                        "lat": r["lat"], "lng": r["lng"]})
-    return result
-
-# ═══════════════════════════════════════════════════════════════════
-# 📍 KONUM — GÜNCELLEME
-# ═══════════════════════════════════════════════════════════════════
-@app.post("/update_location")
-def update_location(data: LocationModel):
-    uid, now = data.userId, now_str()
-
-    try:
-        with db() as conn:
-            cur = conn.cursor()
-
-            # Device registry
-            if data.deviceId:
-                cur.execute("SELECT user_id FROM device_registry WHERE device_id=%s", (data.deviceId,))
-                prev = cur.fetchone()
-                if prev and prev["user_id"] != uid:
-                    old_uid = prev["user_id"]
-                    for tbl, col in [("location_history","user_id"),("locations","user_id"),
-                                     ("rooms","created_by"),("pin_collection_history","user_id"),
-                                     ("room_messages","from_user"),("visibility_settings","user_id")]:
-                        try: cur.execute(f"UPDATE {tbl} SET {col}=%s WHERE {col}=%s", (uid, old_uid))
-                        except: pass
-                    try:
-                        cur.execute("UPDATE scores SET user_id=%s WHERE user_id=%s", (uid, old_uid))
-                    except: pass
-                cur.execute("""INSERT INTO device_registry (device_id,user_id) VALUES (%s,%s)
-                    ON CONFLICT (device_id) DO UPDATE SET user_id=EXCLUDED.user_id""",
-                    (data.deviceId, uid))
-
-            # Idle hesapla
-            idle_status, idle_minutes, idle_start = "online", 0, None
-            cur.execute("SELECT lat,lng,idle_start FROM locations WHERE user_id=%s", (uid,))
-            prev_loc = cur.fetchone()
-            if prev_loc:
-                dist = haversine(prev_loc["lat"] or 0, prev_loc["lng"] or 0, data.lat, data.lng)
-                if dist < IDLE_THRESHOLD:
-                    idle_start = prev_loc["idle_start"] or now
-                    try:
-                        s = TZ.localize(datetime.strptime(idle_start, "%Y-%m-%d %H:%M:%S"))
-                        mins = (datetime.now(TZ) - s).total_seconds() / 60
-                        if mins >= IDLE_MINUTES:
-                            idle_status = "idle"; idle_minutes = int(mins)
-                    except:
-                        idle_start = now
-
-            # Konumu kaydet
-            cur.execute("""
-                INSERT INTO locations
-                  (user_id,device_id,device_type,lat,lng,altitude,speed,animation_type,
-                   room_name,character,last_seen,idle_status,idle_minutes,idle_start)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                ON CONFLICT (user_id) DO UPDATE SET
-                  device_id=EXCLUDED.device_id, device_type=EXCLUDED.device_type,
-                  lat=EXCLUDED.lat, lng=EXCLUDED.lng, altitude=EXCLUDED.altitude,
-                  speed=EXCLUDED.speed, animation_type=EXCLUDED.animation_type,
-                  room_name=EXCLUDED.room_name, character=EXCLUDED.character,
-                  last_seen=EXCLUDED.last_seen, idle_status=EXCLUDED.idle_status,
-                  idle_minutes=EXCLUDED.idle_minutes, idle_start=EXCLUDED.idle_start
-            """, (uid, data.deviceId, data.deviceType, data.lat, data.lng, data.altitude,
-                  data.speed, data.animationType, data.roomName, data.character,
-                  now, idle_status, idle_minutes, idle_start))
-    except Exception as e:
-        print(f"❌ update_location hatası: {e}")
-        return {"status": "error", "error": str(e)}
-
-    # Rota geçmişi (ayrı)
-    try:
-        with db() as conn:
-            cur = conn.cursor()
-            cur.execute("SELECT lat,lng FROM location_history WHERE user_id=%s ORDER BY id DESC LIMIT 1", (uid,))
-            last = cur.fetchone()
-            add = False
-            if not last:
-                add = True
-            else:
-                d = haversine(last["lat"], last["lng"], data.lat, data.lng)
-                s = data.speed
-                if   s >= SPEED_VEHICLE: add = d >= MIN_DIST_VEH
-                elif s >= SPEED_WALK:    add = d >= MIN_DIST_RUN
-                elif s >= 0.5:           add = d >= MIN_DIST_WALK
-                else:                    add = d >= MIN_DIST_IDLE
-            if add:
-                cur.execute("INSERT INTO location_history (user_id,lat,lng,timestamp,speed) VALUES (%s,%s,%s,%s,%s)",
-                            (uid, data.lat, data.lng, now, data.speed))
-    except Exception as e:
-        print(f"⚠️ Rota hatası: {e}")
-
-    # Pin toplama (ayrı)
-    try:
-        with db() as conn:
-            cur = conn.cursor()
-            can = False
-            if data.roomName == "Genel":
-                can = True
-            else:
-                cur.execute("SELECT collectors FROM rooms WHERE room_name=%s", (data.roomName,))
-                rr = cur.fetchone()
-                if rr: can = uid in clist(rr["collectors"])
-            if can:
-                cur.execute("SELECT * FROM pins WHERE room_name=%s", (data.roomName,))
-                for pin in cur.fetchall():
-                    if pin["creator"] == uid: continue
-                    d = haversine(data.lat, data.lng, pin["lat"], pin["lng"])
-                    if d <= PIN_START:
-                        if not pin["collector_id"]:
-                            cur.execute("UPDATE pins SET collector_id=%s,collection_start=%s,collection_time=0 WHERE id=%s",
-                                        (uid, now, pin["id"]))
-                        elif pin["collector_id"] == uid:
-                            try:
-                                s = TZ.localize(datetime.strptime(pin["collection_start"], "%Y-%m-%d %H:%M:%S"))
-                                elapsed = int((datetime.now(TZ) - s).total_seconds())
-                                cur.execute("UPDATE pins SET collection_time=%s WHERE id=%s", (elapsed, pin["id"]))
-                            except: pass
-                    elif d > PIN_END and pin["collector_id"] == uid:
-                        cur.execute("""INSERT INTO scores (room_name,user_id,score) VALUES (%s,%s,1)
-                            ON CONFLICT (room_name,user_id) DO UPDATE SET score=scores.score+1""",
-                            (data.roomName, uid))
-                        cur.execute("""INSERT INTO pin_collection_history
-                            (room_name,user_id,timestamp,created_at,creator,lat,lng)
-                            VALUES (%s,%s,%s,%s,%s,%s,%s)""",
-                            (data.roomName, uid, now, pin["created_at"] or "", pin["creator"], pin["lat"], pin["lng"]))
-                        cur.execute("DELETE FROM pins WHERE id=%s", (pin["id"],))
-    except Exception as e:
-        print(f"⚠️ Pin hatası: {e}")
-
-    return {"status": "ok", "time": now}
-
-# ═══════════════════════════════════════════════════════════════════
-# 📍 KONUM — LİSTE
-# ═══════════════════════════════════════════════════════════════════
-@app.get("/get_locations/{room_name}")
-def get_locations(room_name: str, viewer_id: str = "", viewer_device_id: str = ""):
-    with db() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT * FROM locations WHERE room_name=%s", (room_name,))
-        locs = cur.fetchall()
-        cur.execute("SELECT user_id,mode FROM visibility_settings")
-        vis = {r["user_id"]: r["mode"] for r in cur.fetchall()}
-    result = []
-    for loc in locs:
-        uid = loc["user_id"]
-        if uid == viewer_id: continue
-        if viewer_device_id and loc["device_id"] == viewer_device_id: continue
-        if not is_online(loc["last_seen"]): continue
-        if vis.get(uid) == "hidden": continue
-        result.append({
-            "userId": uid, "deviceId": loc["device_id"],
-            "lat": loc["lat"], "lng": loc["lng"],
-            "deviceType": loc["device_type"], "altitude": loc["altitude"] or 0,
-            "speed": loc["speed"] or 0, "animationType": loc["animation_type"] or "pulse",
-            "roomName": loc["room_name"], "idleStatus": loc["idle_status"] or "online",
-            "idleMinutes": loc["idle_minutes"] or 0, "character": loc["character"] or "🧍",
-        })
-    return result
-
-# ═══════════════════════════════════════════════════════════════════
-# 📍 ROTA GEÇMİŞİ
-# ═══════════════════════════════════════════════════════════════════
-@app.get("/get_location_history/{user_id}")
-def get_location_history(user_id: str, period: str = "all", device_id: str = ""):
-    with db() as conn:
-        cur = conn.cursor()
-        if device_id:
-            cur.execute("SELECT user_id FROM device_registry WHERE device_id=%s", (device_id,))
-            row = cur.fetchone()
-            if row: user_id = row["user_id"]
-        if period == "all":
-            cur.execute("SELECT lat,lng,timestamp,speed FROM location_history WHERE user_id=%s ORDER BY id", (user_id,))
-        else:
-            delta = {"day":1,"week":7,"month":30,"year":365}.get(period,30)
-            cutoff = (datetime.now(TZ) - timedelta(days=delta)).strftime("%Y-%m-%d %H:%M:%S")
-            cur.execute("SELECT lat,lng,timestamp,speed FROM location_history WHERE user_id=%s AND timestamp>%s ORDER BY id",
-                        (user_id, cutoff))
-        return cur.fetchall()
-
-@app.delete("/clear_history/{user_id}")
-def clear_history(user_id: str):
-    with db() as conn:
-        cur = conn.cursor()
-        cur.execute("DELETE FROM location_history WHERE user_id=%s", (user_id,))
-    return {"message": "✅ Geçmiş temizlendi"}
-
-# ═══════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════════
 # 🚪 ODA YÖNETİMİ
-# ═══════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════════
+
 @app.post("/create_room")
 def create_room(data: RoomModel):
+    if data.roomName in rooms:
+        raise HTTPException(status_code=400, detail="Bu oda adı zaten mevcut!")
     if len(data.password) < 3:
-        raise HTTPException(400, "Şifre en az 3 karakter!")
-    with db() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT 1 FROM rooms WHERE room_name=%s", (data.roomName,))
-        if cur.fetchone(): raise HTTPException(400, "Bu oda adı zaten var!")
-        cur.execute("""INSERT INTO rooms (room_name,password,created_by,created_by_device,created_at)
-            VALUES (%s,%s,%s,%s,%s)""",
-            (data.roomName, data.password, data.createdBy, data.createdByDevice, now_str()))
-    return {"message": f"✅ {data.roomName} oluşturuldu"}
+        raise HTTPException(status_code=400, detail="Şifre en az 3 karakter olmalı!")
+    rooms[data.roomName] = {
+        "name": data.roomName,
+        "password": data.password,
+        "createdBy": data.createdBy,
+        "createdAt": get_local_time(),
+        "collectors": [],
+    }
+    return {"message": f"✅ {data.roomName} odası oluşturuldu"}
 
 @app.post("/join_room")
 def join_room(data: JoinRoomModel):
-    if data.roomName == "Genel": return {"message": "Genel'e katıldınız"}
-    with db() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT password FROM rooms WHERE room_name=%s", (data.roomName,))
-        row = cur.fetchone()
-        if not row: raise HTTPException(404, "Oda bulunamadı!")
-        if row["password"] != data.password: raise HTTPException(401, "Yanlış şifre!")
-    return {"message": f"✅ {data.roomName}'a katıldınız"}
+    if data.roomName == "Genel":
+        return {"message": "Genel odaya katıldınız"}
+    if data.roomName not in rooms:
+        raise HTTPException(status_code=404, detail="Oda bulunamadı!")
+    if rooms[data.roomName]["password"] != data.password:
+        raise HTTPException(status_code=401, detail="Yanlış şifre!")
+    return {"message": f"✅ {data.roomName} odasına katıldınız"}
 
 @app.get("/get_rooms")
 def get_rooms(user_id: str = ""):
-    with db() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT * FROM rooms")
-        rooms = cur.fetchall()
-        cur.execute("SELECT room_name, COUNT(*) as c FROM locations GROUP BY room_name")
-        counts = {r["room_name"]: r["c"] for r in cur.fetchall()}
-    result = [{"name":"Genel","hasPassword":False,"userCount":counts.get("Genel",0),"isAdmin":False,"password":None}]
-    for r in rooms:
-        is_admin = r["created_by"] == user_id
-        result.append({"name":r["room_name"],"hasPassword":True,
-                        "userCount":counts.get(r["room_name"],0),
-                        "createdBy":r["created_by"],"isAdmin":is_admin,
-                        "password":r["password"] if is_admin else None})
+    result = [
+        {
+            "name": "Genel",
+            "hasPassword": False,
+            "userCount": sum(1 for u in locations.values()
+                           if u.get("roomName") == "Genel"
+                           and is_user_online(u.get("lastSeen", ""))),
+            "createdBy": "system",
+            "isAdmin": False,
+            "password": None,
+        }
+    ]
+    for room_name, room in rooms.items():
+        is_admin = room["createdBy"] == user_id
+        result.append({
+            "name": room_name,
+            "hasPassword": True,
+            "userCount": sum(1 for u in locations.values()
+                           if u.get("roomName") == room_name
+                           and is_user_online(u.get("lastSeen", ""))),
+            "createdBy": room["createdBy"],
+            "isAdmin": is_admin,
+            "password": room["password"] if is_admin else None,
+        })
     return result
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 👑 ADMİN FONKSİYONLARI
+# ═══════════════════════════════════════════════════════════════════════════════
 
 @app.delete("/delete_room/{room_name}")
 def delete_room(room_name: str, admin_id: str):
-    with db() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT created_by FROM rooms WHERE room_name=%s", (room_name,))
-        row = cur.fetchone()
-        if not row: raise HTTPException(404, "Oda bulunamadı!")
-        if row["created_by"] != admin_id: raise HTTPException(403, "Sadece admin silebilir!")
-        cur.execute("DELETE FROM rooms WHERE room_name=%s", (room_name,))
-        cur.execute("UPDATE locations SET room_name='Genel' WHERE room_name=%s", (room_name,))
-        cur.execute("DELETE FROM pins WHERE room_name=%s", (room_name,))
-        cur.execute("DELETE FROM room_messages WHERE room_name=%s", (room_name,))
-    return {"message": f"✅ {room_name} silindi"}
-
-@app.get("/get_room_permissions/{room_name}")
-def get_room_permissions(room_name: str, user_id: str = ""):
-    if room_name == "Genel": return {"admin": None, "collectors": [], "voiceAllowed": []}
-    with db() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT created_by,collectors FROM rooms WHERE room_name=%s", (room_name,))
-        row = cur.fetchone()
-        if not row: return {"admin": None, "collectors": [], "voiceAllowed": []}
-    return {"admin": row["created_by"], "collectors": clist(row["collectors"]), "voiceAllowed": []}
-
-@app.post("/set_collector_permission/{room_name}/{target_user}")
-def set_collector_permission(room_name: str, target_user: str, admin_id: str, enabled: bool):
-    with db() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT created_by, collectors FROM rooms WHERE room_name=%s", (room_name,))
-        row = cur.fetchone()
-        if not row: raise HTTPException(404, "Oda bulunamadı!")
-        if row["created_by"] != admin_id: raise HTTPException(403, "Sadece admin yetkilendirebilir!")
-        lst = clist(row["collectors"])
-        if enabled and target_user not in lst: lst.append(target_user)
-        elif not enabled and target_user in lst: lst.remove(target_user)
-        cur.execute("UPDATE rooms SET collectors=%s WHERE room_name=%s", (json.dumps(lst), room_name))
-    return {"message": "✅ Yetki güncellendi"}
-
-@app.post("/set_voice_permission/{room_name}/{target_user}")
-def set_voice_permission(room_name: str, target_user: str, admin_id: str, enabled: bool):
-    return {"message": "✅ (Ses yetkisi bu sürümde oda bazlı değil)"}
+    if room_name not in rooms:
+        raise HTTPException(status_code=404, detail="Oda bulunamadı!")
+    if rooms[room_name]["createdBy"] != admin_id:
+        raise HTTPException(status_code=403, detail="Sadece admin silebilir!")
+    del rooms[room_name]
+    # Üyeleri Genel'e taşı
+    for uid in locations:
+        if locations[uid].get("roomName") == room_name:
+            locations[uid]["roomName"] = "Genel"
+    # Pinleri sil
+    for pin_id in list(pins.keys()):
+        if pins[pin_id].get("roomName") == room_name:
+            del pins[pin_id]
+    # Skorları sil
+    for key in list(scores.keys()):
+        if key.startswith(f"{room_name}_"):
+            del scores[key]
+    # Grup mesajlarını sil
+    if room_name in room_messages:
+        del room_messages[room_name]
+    return {"message": f"✅ {room_name} odası silindi"}
 
 @app.get("/get_room_password/{room_name}")
 def get_room_password(room_name: str, admin_id: str):
-    with db() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT password,created_by FROM rooms WHERE room_name=%s", (room_name,))
-        row = cur.fetchone()
-        if not row: raise HTTPException(404, "Oda bulunamadı!")
-        if row["created_by"] != admin_id: raise HTTPException(403, "Sadece admin görebilir!")
-    return {"password": row["password"]}
+    if room_name not in rooms:
+        raise HTTPException(status_code=404, detail="Oda bulunamadı!")
+    if rooms[room_name]["createdBy"] != admin_id:
+        raise HTTPException(status_code=403, detail="Sadece admin görebilir!")
+    return {"password": rooms[room_name]["password"]}
 
-# ═══════════════════════════════════════════════════════════════════
+@app.post("/change_room_password/{room_name}")
+def change_room_password(room_name: str, admin_id: str, new_password: str):
+    if room_name not in rooms:
+        raise HTTPException(status_code=404, detail="Oda bulunamadı!")
+    if rooms[room_name]["createdBy"] != admin_id:
+        raise HTTPException(status_code=403, detail="Sadece admin değiştirebilir!")
+    if len(new_password) < 3:
+        raise HTTPException(status_code=400, detail="Şifre en az 3 karakter!")
+    rooms[room_name]["password"] = new_password
+    return {"message": "✅ Şifre değiştirildi"}
+
+@app.get("/get_room_permissions/{room_name}")
+def get_room_permissions(room_name: str):
+    if room_name == "Genel":
+        return {"admin": None, "collectors": []}
+    if room_name not in rooms:
+        return {"admin": None, "collectors": []}
+    return {
+        "admin": rooms[room_name]["createdBy"],
+        "collectors": rooms[room_name].get("collectors", []),
+    }
+
+@app.post("/set_collector_permission/{room_name}/{target_user}")
+def set_collector_permission(room_name: str, target_user: str,
+                              admin_id: str, enabled: bool):
+    if room_name not in rooms:
+        raise HTTPException(status_code=404, detail="Oda bulunamadı!")
+    if rooms[room_name]["createdBy"] != admin_id:
+        raise HTTPException(status_code=403, detail="Sadece admin yetkilendirebilir!")
+    collectors = rooms[room_name].get("collectors", [])
+    if enabled and target_user not in collectors:
+        collectors.append(target_user)
+    elif not enabled and target_user in collectors:
+        collectors.remove(target_user)
+    rooms[room_name]["collectors"] = collectors
+    return {"message": "✅ Yetki güncellendi", "collectors": collectors}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 👁️ GÖRÜNÜRLİK SİSTEMİ
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@app.post("/set_visibility")
+def set_visibility(data: VisibilityModel):
+    visibility_settings[data.userId] = {
+        "mode": data.mode,
+        "allowed": data.allowed,
+    }
+    return {"message": "✅ Görünürlük güncellendi"}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 📍 KONUM GÜNCELLEMESİ (ANA FONKSİYON)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@app.post("/update_location")
+def update_location(data: LocationModel):
+    uid = data.userId
+    now = get_local_time()
+
+    # 1️⃣ HAREKETSİZLİK KONTROLÜ
+    idle_status = "online"
+    idle_minutes = 0
+    if uid in locations:
+        old = locations[uid]
+        dist = haversine(old["lat"], old["lng"], data.lat, data.lng)
+        if dist < IDLE_THRESHOLD:
+            # Hareket yok, idle süresini artır
+            idle_start = old.get("idleStart")
+            if idle_start is None:
+                idle_start = now
+            else:
+                try:
+                    start_dt = datetime.strptime(idle_start, "%Y-%m-%d %H:%M:%S")
+                    start_dt = DEFAULT_TIMEZONE.localize(start_dt)
+                    now_dt = datetime.now(DEFAULT_TIMEZONE)
+                    minutes = (now_dt - start_dt).total_seconds() / 60
+                    if minutes >= IDLE_TIME_MINUTES:
+                        idle_status = "idle"
+                        idle_minutes = int(minutes)
+                except:
+                    idle_start = now
+        else:
+            idle_start = None
+    else:
+        idle_start = None
+
+    # 2️⃣ ROTA GEÇMİŞİNE EKLE (HIZA GÖRE FİLTRELEME)
+    should_add = False
+    if uid not in location_history:
+        location_history[uid] = []
+        should_add = True
+    else:
+        history = location_history[uid]
+        if len(history) == 0:
+            should_add = True
+        else:
+            last = history[-1]
+            dist = haversine(last["lat"], last["lng"], data.lat, data.lng)
+            speed = data.speed
+            if speed >= SPEED_VEHICLE:
+                should_add = dist >= MIN_DIST_VEHICLE
+            elif speed >= SPEED_WALK:
+                should_add = dist >= MIN_DIST_RUN
+            elif speed >= 0.5:
+                should_add = dist >= MIN_DIST_WALK
+            else:
+                should_add = dist >= MIN_DIST_IDLE
+
+    if should_add:
+        location_history[uid].append({
+            "lat": data.lat,
+            "lng": data.lng,
+            "timestamp": now,
+            "speed": data.speed,
+        })
+        cleanup_old_routes()
+
+    # 3️⃣ PIN TOPLAMA SİSTEMİ
+    if uid in locations:
+        room = data.roomName
+        can_collect = False
+        if room in rooms:
+            can_collect = uid in rooms[room].get("collectors", [])
+
+        if can_collect:
+            for pin_id, pin in list(pins.items()):
+                if pin.get("roomName") != room:
+                    continue
+                if pin.get("creator") == uid:
+                    continue
+
+                pin_dist = haversine(data.lat, data.lng, pin["lat"], pin["lng"])
+
+                if pin_dist <= PIN_COLLECT_START:
+                    if pin.get("collectorId") is None:
+                        pins[pin_id]["collectorId"] = uid
+                        pins[pin_id]["collectionStart"] = now
+                        pins[pin_id]["collectionTime"] = 0
+                    elif pin.get("collectorId") == uid:
+                        try:
+                            start = datetime.strptime(
+                                pin["collectionStart"], "%Y-%m-%d %H:%M:%S")
+                            start = DEFAULT_TIMEZONE.localize(start)
+                            now_dt = datetime.now(DEFAULT_TIMEZONE)
+                            elapsed = int((now_dt - start).total_seconds())
+                            pins[pin_id]["collectionTime"] = elapsed
+                        except:
+                            pass
+
+                elif pin_dist > PIN_COLLECT_END and pin.get("collectorId") == uid:
+                    # Pin toplandı!
+                    score_key = f"{room}_{uid}"
+                    scores[score_key] = scores.get(score_key, 0) + 1
+
+                    history_key = f"{room}_{uid}"
+                    if history_key not in pin_collection_history:
+                        pin_collection_history[history_key] = []
+                    pin_collection_history[history_key].append({
+                        "timestamp": now,
+                        "createdAt": pin.get("createdAt", "Bilinmiyor"),
+                        "creator": pin.get("creator", ""),
+                        "lat": pin["lat"],
+                        "lng": pin["lng"],
+                    })
+                    del pins[pin_id]
+
+    # 4️⃣ KONUMU GÜNCELLE
+    locations[uid] = {
+        "userId": uid,
+        "deviceId": data.deviceId,
+        "deviceType": data.deviceType,
+        "lat": data.lat,
+        "lng": data.lng,
+        "altitude": data.altitude,
+        "speed": data.speed,
+        "animationType": data.animationType,
+        "roomName": data.roomName,
+        "character": data.character,
+        "lastSeen": now,
+        "idleStatus": idle_status,
+        "idleMinutes": idle_minutes,
+        "idleStart": idle_start,
+    }
+
+    return {"status": "ok", "time": now}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 📍 KONUM LİSTESİ VE GEÇMİŞ
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@app.get("/get_locations/{room_name}")
+def get_locations(room_name: str, viewer_id: str = ""):
+    result = []
+    for uid, data in locations.items():
+        if uid == viewer_id:
+            continue
+        if not is_user_online(data.get("lastSeen", "")):
+            continue
+        if data.get("roomName") != room_name:
+            continue
+
+        vis = visibility_settings.get(uid, {"mode": "all"})
+        if vis["mode"] == "hidden":
+            continue
+        if vis["mode"] == "room":
+            viewer_room = locations.get(viewer_id, {}).get("roomName", "Genel")
+            if viewer_room != data.get("roomName"):
+                continue
+
+        result.append({
+            "userId": uid,
+            "deviceId": data.get("deviceId", ""),
+            "lat": data["lat"],
+            "lng": data["lng"],
+            "deviceType": data.get("deviceType", "phone"),
+            "altitude": data.get("altitude", 0),
+            "speed": data.get("speed", 0),
+            "animationType": data.get("animationType", "pulse"),
+            "roomName": data.get("roomName", "Genel"),
+            "idleStatus": data.get("idleStatus", "online"),
+            "idleMinutes": data.get("idleMinutes", 0),
+            "character": data.get("character", "🧍"),
+        })
+    return result
+
+@app.get("/get_location_history/{user_id}")
+def get_location_history(user_id: str, period: str = "all"):
+    history = location_history.get(user_id, [])
+    if period == "all":
+        return history
+    now = datetime.now(DEFAULT_TIMEZONE)
+    if period == "day":
+        cutoff = now - timedelta(days=1)
+    elif period == "week":
+        cutoff = now - timedelta(weeks=1)
+    elif period == "month":
+        cutoff = now - timedelta(days=30)
+    elif period == "year":
+        cutoff = now - timedelta(days=365)
+    else:
+        return history
+    return [
+        p for p in history
+        if datetime.strptime(p["timestamp"], "%Y-%m-%d %H:%M:%S").replace(
+            tzinfo=DEFAULT_TIMEZONE) > cutoff
+    ]
+
+@app.delete("/clear_history/{user_id}")
+def clear_history(user_id: str):
+    if user_id in location_history:
+        location_history[user_id] = []
+    return {"message": "✅ Geçmiş temizlendi"}
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # 📍 PIN SİSTEMİ
-# ═══════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════════
+
 @app.post("/create_pin")
 def create_pin(data: PinModel):
-    with db() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT 1 FROM pins WHERE creator=%s AND room_name=%s", (data.creator, data.roomName))
-        if cur.fetchone(): raise HTTPException(400, "Zaten bir pininiz var!")
-        pin_id = str(uuid.uuid4())[:8]
-        cur.execute("""INSERT INTO pins (id,room_name,creator,lat,lng,created_at)
-            VALUES (%s,%s,%s,%s,%s,%s)""",
-            (pin_id, data.roomName, data.creator, data.lat, data.lng, now_str()))
+    for pin in pins.values():
+        if pin["creator"] == data.creator and pin["roomName"] == data.roomName:
+            raise HTTPException(status_code=400,
+                detail="Zaten bir pininiz var! Önce kaldırın.")
+    pin_id = str(uuid.uuid4())[:8]
+    pins[pin_id] = {
+        "id": pin_id,
+        "roomName": data.roomName,
+        "creator": data.creator,
+        "lat": data.lat,
+        "lng": data.lng,
+        "createdAt": get_local_time(),
+        "collectorId": None,
+        "collectionStart": None,
+        "collectionTime": 0,
+    }
     return {"message": "✅ Pin yerleştirildi", "pinId": pin_id}
 
 @app.get("/get_pins/{room_name}")
 def get_pins(room_name: str):
-    with db() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT * FROM pins WHERE room_name=%s", (room_name,))
-        return cur.fetchall()
+    return [p for p in pins.values() if p.get("roomName") == room_name]
 
 @app.delete("/remove_pin/{pin_id}")
 def remove_pin(pin_id: str, user_id: str):
-    with db() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT creator FROM pins WHERE id=%s", (pin_id,))
-        row = cur.fetchone()
-        if not row: raise HTTPException(404, "Pin bulunamadı!")
-        if row["creator"] != user_id: raise HTTPException(403, "Sadece pin sahibi kaldırabilir!")
-        cur.execute("DELETE FROM pins WHERE id=%s", (pin_id,))
+    if pin_id not in pins:
+        raise HTTPException(status_code=404, detail="Pin bulunamadı!")
+    if pins[pin_id]["creator"] != user_id:
+        raise HTTPException(status_code=403, detail="Sadece pin sahibi kaldırabilir!")
+    del pins[pin_id]
     return {"message": "✅ Pin kaldırıldı"}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 🔑 YETKİ VE SKOR SİSTEMİ
+# ═══════════════════════════════════════════════════════════════════════════════
 
 @app.get("/get_scores/{room_name}")
 def get_scores(room_name: str):
-    with db() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT user_id, score FROM scores WHERE room_name=%s ORDER BY score DESC", (room_name,))
-        return [{"userId": r["user_id"], "score": r["score"]} for r in cur.fetchall()]
+    result = []
+    for key, score in scores.items():
+        if key.startswith(f"{room_name}_"):
+            uid = key[len(f"{room_name}_"):]
+            result.append({"userId": uid, "score": score})
+    result.sort(key=lambda x: x["score"], reverse=True)
+    return result
 
 @app.get("/get_collection_history/{room_name}/{user_id}")
 def get_collection_history(room_name: str, user_id: str):
-    with db() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT * FROM pin_collection_history WHERE room_name=%s AND user_id=%s", (room_name, user_id))
-        return cur.fetchall()
+    key = f"{room_name}_{user_id}"
+    return pin_collection_history.get(key, [])
 
-# ═══════════════════════════════════════════════════════════════════
-# 💬 MESAJLAŞMA
-# ═══════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════════
+# 💬 1-1 MESAJLAŞMA SİSTEMİ
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def get_conv_key(user1: str, user2: str) -> str:
+    return "_".join(sorted([user1, user2]))
+
 @app.post("/send_message")
 def send_message(data: MessageModel):
-    with db() as conn:
-        cur = conn.cursor()
-        cur.execute("""INSERT INTO messages (from_user,to_user,conv_key,message,timestamp)
-            VALUES (%s,%s,%s,%s,%s)""",
-            (data.fromUser, data.toUser, ckey(data.fromUser,data.toUser), data.message, now_str()))
-    return {"message": "✅ Gönderildi"}
+    key = get_conv_key(data.fromUser, data.toUser)
+    if key not in messages:
+        messages[key] = []
+    messages[key].append({
+        "from": data.fromUser,
+        "to": data.toUser,
+        "message": data.message,
+        "timestamp": get_local_time(),
+        "read": False,
+    })
+    return {"message": "✅ Mesaj gönderildi"}
 
 @app.get("/get_conversation/{user1}/{user2}")
 def get_conversation(user1: str, user2: str):
-    with db() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT * FROM messages WHERE conv_key=%s ORDER BY id", (ckey(user1,user2),))
-        return cur.fetchall()
+    key = get_conv_key(user1, user2)
+    return messages.get(key, [])
 
 @app.post("/mark_as_read/{user_id}/{other_user}")
 def mark_as_read(user_id: str, other_user: str):
-    with db() as conn:
-        cur = conn.cursor()
-        cur.execute("UPDATE messages SET is_read=TRUE WHERE conv_key=%s AND to_user=%s",
-                    (ckey(user_id,other_user), user_id))
+    key = get_conv_key(user_id, other_user)
+    if key in messages:
+        for msg in messages[key]:
+            if msg["to"] == user_id:
+                msg["read"] = True
     return {"message": "✅ Okundu"}
 
 @app.get("/get_unread_count/{user_id}")
 def get_unread_count(user_id: str):
-    with db() as conn:
-        cur = conn.cursor()
-        cur.execute("""SELECT from_user, COUNT(*) as c FROM messages
-            WHERE to_user=%s AND is_read=FALSE GROUP BY from_user""", (user_id,))
-        return {r["from_user"]: r["c"] for r in cur.fetchall()}
+    result = {}
+    for key, conv in messages.items():
+        for msg in conv:
+            if msg["to"] == user_id and not msg["read"]:
+                sender = msg["from"]
+                result[sender] = result.get(sender, 0) + 1
+    return result
 
-# ═══════════════════════════════════════════════════════════════════
-# 👥 GRUP MESAJ
-# ═══════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════════
+# 👥 GRUP MESAJLAŞMA SİSTEMİ
+# ═══════════════════════════════════════════════════════════════════════════════
+
 @app.post("/send_room_message")
 def send_room_message(data: RoomMessageModel):
-    with db() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT character FROM locations WHERE user_id=%s", (data.fromUser,))
-        row = cur.fetchone()
-        char = row["character"] if row else "🧍"
-        cur.execute("""INSERT INTO room_messages (id,room_name,from_user,message,timestamp,character)
-            VALUES (%s,%s,%s,%s,%s,%s)""",
-            (str(uuid.uuid4())[:8], data.roomName, data.fromUser, data.message, now_str(), char))
-        cur.execute("""DELETE FROM room_messages WHERE room_name=%s AND id NOT IN (
-            SELECT id FROM room_messages WHERE room_name=%s ORDER BY timestamp DESC LIMIT %s)""",
-            (data.roomName, data.roomName, MAX_ROOM_MSG))
-    return {"message": "✅ Gönderildi"}
+    """Odaya grup mesajı gönder"""
+    room = data.roomName
+
+    # Oda kontrolü (Genel dahil)
+    if room != "Genel" and room not in rooms:
+        raise HTTPException(status_code=404, detail="Oda bulunamadı!")
+
+    if room not in room_messages:
+        room_messages[room] = []
+
+    room_messages[room].append({
+        "id": str(uuid.uuid4())[:8],
+        "from": data.fromUser,
+        "message": data.message,
+        "timestamp": get_local_time(),
+        "character": locations.get(data.fromUser, {}).get("character", "🧍"),
+    })
+
+    # Eski mesajları temizle
+    if len(room_messages[room]) > MAX_ROOM_MESSAGES:
+        room_messages[room] = room_messages[room][-MAX_ROOM_MESSAGES:]
+
+    return {"message": "✅ Grup mesajı gönderildi"}
 
 @app.get("/get_room_messages/{room_name}")
 def get_room_messages(room_name: str, limit: int = 50):
-    with db() as conn:
-        cur = conn.cursor()
-        cur.execute("""SELECT * FROM (SELECT * FROM room_messages WHERE room_name=%s
-            ORDER BY timestamp DESC LIMIT %s) sub ORDER BY timestamp ASC""",
-            (room_name, limit))
-        return cur.fetchall()
+    """Oda grup mesajlarını getir"""
+    msgs = room_messages.get(room_name, [])
+    return msgs[-limit:]  # Son N mesajı döndür
 
 @app.get("/get_room_messages_since/{room_name}")
 def get_room_messages_since(room_name: str, last_id: str = ""):
-    with db() as conn:
-        cur = conn.cursor()
-        if not last_id:
-            cur.execute("""SELECT * FROM room_messages WHERE room_name=%s
-                ORDER BY timestamp DESC LIMIT 50""", (room_name,))
-            rows = list(reversed(cur.fetchall()))
-            return rows
-        cur.execute("SELECT timestamp FROM room_messages WHERE id=%s", (last_id,))
-        row = cur.fetchone()
-        if not row:
-            cur.execute("SELECT * FROM room_messages WHERE room_name=%s ORDER BY timestamp DESC LIMIT 50", (room_name,))
-            return list(reversed(cur.fetchall()))
-        cur.execute("SELECT * FROM room_messages WHERE room_name=%s AND timestamp>%s ORDER BY timestamp ASC",
-                    (room_name, row["timestamp"]))
-        return cur.fetchall()
+    """Son mesaj ID'sinden sonrakileri getir (polling için)"""
+    msgs = room_messages.get(room_name, [])
+    if not last_id:
+        return msgs[-50:]
+    # Son ID'den sonrakileri bul
+    for i, msg in enumerate(msgs):
+        if msg["id"] == last_id:
+            return msgs[i+1:]
+    return msgs[-50:]
 
-# ═══════════════════════════════════════════════════════════════════
-# 👁️ GÖRÜNÜRLİK
-# ═══════════════════════════════════════════════════════════════════
-@app.post("/set_visibility")
-def set_visibility(data: VisibilityModel):
-    with db() as conn:
-        cur = conn.cursor()
-        cur.execute("""INSERT INTO visibility_settings (user_id,mode,allowed) VALUES (%s,%s,%s)
-            ON CONFLICT (user_id) DO UPDATE SET mode=EXCLUDED.mode, allowed=EXCLUDED.allowed""",
-            (data.userId, data.mode, json.dumps(data.allowed)))
-    return {"message": "✅ Güncellendi"}
+# ═══════════════════════════════════════════════════════════════════════════════
+# 👤 KULLANICI ADI DEĞİŞTİRME
+# ═══════════════════════════════════════════════════════════════════════════════
 
-# ═══════════════════════════════════════════════════════════════════
-# 👤 KULLANICI ADI DEĞİŞTİR
-# ═══════════════════════════════════════════════════════════════════
 @app.post("/change_username")
 def change_username(data: ChangeUsernameModel):
-    old, new = data.oldName, data.newName.strip()
-    if not new: raise HTTPException(400, "İsim boş olamaz!")
-    with db() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT 1 FROM locations WHERE user_id=%s", (new,))
-        if cur.fetchone() and new != old: raise HTTPException(400, "Bu isim kullanımda!")
-        cur.execute("UPDATE device_registry SET user_id=%s WHERE user_id=%s", (new, old))
-        cur.execute("UPDATE locations SET user_id=%s WHERE user_id=%s", (new, old))
-        cur.execute("UPDATE location_history SET user_id=%s WHERE user_id=%s", (new, old))
-        cur.execute("UPDATE rooms SET created_by=%s WHERE created_by=%s", (new, old))
-        cur.execute("UPDATE scores SET user_id=%s WHERE user_id=%s", (new, old))
-        cur.execute("UPDATE pin_collection_history SET user_id=%s WHERE user_id=%s", (new, old))
-        cur.execute("UPDATE room_messages SET from_user=%s WHERE from_user=%s", (new, old))
-        cur.execute("UPDATE visibility_settings SET user_id=%s WHERE user_id=%s", (new, old))
-        cur.execute("SELECT id,from_user,to_user FROM messages WHERE from_user=%s OR to_user=%s", (old,old))
-        for msg in cur.fetchall():
-            nf = new if msg["from_user"]==old else msg["from_user"]
-            nt = new if msg["to_user"]==old else msg["to_user"]
-            cur.execute("UPDATE messages SET from_user=%s,to_user=%s,conv_key=%s WHERE id=%s",
-                        (nf, nt, ckey(nf,nt), msg["id"]))
-    return {"message": f"✅ {old} → {new}"}
+    old = data.oldName
+    new = data.newName
 
-# ═══════════════════════════════════════════════════════════════════
-# 🔐 YETKİ İSTEK SİSTEMİ
-# ═══════════════════════════════════════════════════════════════════
-_perm_requests = {}  # RAM
+    if not new or len(new.strip()) < 1:
+        raise HTTPException(status_code=400, detail="İsim boş olamaz!")
 
-class PermRequestModel(BaseModel):
-    roomName: str; requesterUserId: str
-    permissionType: str = ""; type: str = ""
-    message: str = ""; note: str = ""
+    if new in locations and new != old:
+        raise HTTPException(status_code=400, detail="Bu isim zaten kullanımda!")
 
-@app.post("/request_permission")
-def request_permission(data: PermRequestModel):
-    req_id = str(uuid.uuid4())[:8]
-    ptype = data.permissionType or data.type
-    if data.roomName not in _perm_requests: _perm_requests[data.roomName] = []
-    _perm_requests[data.roomName].append({
-        "id":req_id,"requester":data.requesterUserId,
-        "type":ptype,"note":data.message or data.note,"time":now_str()})
-    return {"message":"✅ İstek gönderildi","requestId":req_id}
+    # Konum verisini taşı
+    if old in locations:
+        locations[new] = locations.pop(old)
+        locations[new]["userId"] = new
 
-@app.get("/get_permission_requests/{room_name}")
-def get_permission_requests(room_name: str, admin_id: str = ""):
-    return _perm_requests.get(room_name, [])
+    # Rota geçmişini taşı
+    if old in location_history:
+        location_history[new] = location_history.pop(old)
 
-@app.post("/respond_permission/{request_id}")
-def respond_permission(request_id: str, approved: bool, admin_id: str = ""):
-    for key, reqs in _perm_requests.items():
-        for req in reqs:
-            if req["id"] == request_id:
-                reqs.remove(req)
-                return {"message": "✅ Yanıt verildi", "approved": approved}
-    raise HTTPException(404, "İstek bulunamadı")
+    # Skorları taşı
+    for key in list(scores.keys()):
+        if key.endswith(f"_{old}"):
+            room = key[:-(len(old)+1)]
+            scores[f"{room}_{new}"] = scores.pop(key)
 
-@app.get("/check_permission_status/{request_id}")
-def check_permission_status(request_id: str):
-    for reqs in _perm_requests.values():
-        for req in reqs:
-            if req["id"] == request_id:
-                return {"status": "pending"}
-    return {"status": "approved"}
+    # Pin geçmişini taşı
+    for key in list(pin_collection_history.keys()):
+        if key.endswith(f"_{old}"):
+            room = key[:-(len(old)+1)]
+            pin_collection_history[f"{room}_{new}"] = pin_collection_history.pop(key)
 
-# ═══════════════════════════════════════════════════════════════════
-# 🎵 MÜZİK YETKİSİ
-# ═══════════════════════════════════════════════════════════════════
-@app.get("/get_music_permission/{room_name}/{user_id}")
-def get_music_permission(room_name: str, user_id: str, device_id: str = ""):
-    if device_id in _master_devices: return {"canBroadcast": True, "reason": "master"}
-    with db() as conn:
-        cur = conn.cursor()
-        if device_id:
-            cur.execute("SELECT device_id FROM locations WHERE user_id=%s", (user_id,))
-            row = cur.fetchone()
-            if row and row["device_id"] in _master_devices:
-                return {"canBroadcast": True, "reason": "master"}
-        if room_name == "Genel":
-            return {"canBroadcast": user_id in _master_music_allowed, "reason": "master_allowed"}
-        cur.execute("SELECT created_by, music_allowed FROM rooms WHERE room_name=%s", (room_name,))
-        row = cur.fetchone()
-        if not row: return {"canBroadcast": False, "reason": "no_room"}
-        if row["created_by"] == user_id: return {"canBroadcast": True, "reason": "admin"}
-        allowed = clist(row["music_allowed"])
-    return {"canBroadcast": user_id in allowed, "reason": "allowed"}
+    # 1-1 Mesajları taşı
+    for key in list(messages.keys()):
+        parts = key.split('_')
+        if old in parts:
+            # Eski konuşmayı al
+            conv = messages.pop(key)
+            # Mesajlardaki from/to alanlarını güncelle
+            for msg in conv:
+                if msg['from'] == old:
+                    msg['from'] = new
+                if msg['to'] == old:
+                    msg['to'] = new
+            # Yeni anahtarla kaydet
+            other = parts[1] if parts[0] == old else parts[0]
+            new_key = '_'.join(sorted([new, other]))
+            # Eğer yeni anahtarda zaten mesaj varsa birleştir
+            if new_key in messages:
+                messages[new_key].extend(conv)
+                messages[new_key].sort(key=lambda m: m.get('timestamp', ''))
+            else:
+                messages[new_key] = conv
 
-@app.post("/set_music_permission/{room_name}/{target_user}")
-def set_music_permission(room_name: str, target_user: str, admin_id: str, enabled: bool):
-    if room_name == "Genel":
-        if admin_id not in _master_devices:
-            with db() as conn:
-                cur = conn.cursor()
-                cur.execute("SELECT device_id FROM locations WHERE user_id=%s", (admin_id,))
-                row = cur.fetchone()
-                if not row or row["device_id"] not in _master_devices:
-                    raise HTTPException(403, "Sadece master admin yetkilendirebilir!")
-        if enabled: _master_music_allowed.add(target_user)
-        else: _master_music_allowed.discard(target_user)
-        return {"message": "✅ Müzik yetkisi güncellendi"}
-    with db() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT created_by, music_allowed FROM rooms WHERE room_name=%s", (room_name,))
-        row = cur.fetchone()
-        if not row: raise HTTPException(404, "Oda bulunamadı!")
-        if row["created_by"] != admin_id: raise HTTPException(403, "Sadece admin yetkilendirebilir!")
-        lst = clist(row["music_allowed"])
-        if enabled and target_user not in lst: lst.append(target_user)
-        elif not enabled and target_user in lst: lst.remove(target_user)
-        cur.execute("UPDATE rooms SET music_allowed=%s WHERE room_name=%s", (json.dumps(lst), room_name))
-    return {"message": "✅ Müzik yetkisi güncellendi"}
+    # Grup mesajlarında from alanını güncelle
+    for room_msgs in room_messages.values():
+        for msg in room_msgs:
+            if msg.get('from') == old:
+                msg['from'] = new
 
-# ═══════════════════════════════════════════════════════════════════
-# 🎙️ WALKİE-TALKİE
-# ═══════════════════════════════════════════════════════════════════
-@app.post("/walkie_send")
-def walkie_send(data: WalkieSendModel):
-    key = ckey(data.fromUser, data.toUser)
-    _walkie_p2p[key] = {"id":str(uuid.uuid4())[:8],"from":data.fromUser,"audio":data.audioBase64,"timestamp":now_str()}
-    return {"message":"✅ Gönderildi"}
+    return {"message": f"✅ İsim değiştirildi: {old} → {new}"}
 
-@app.get("/walkie_listen/{user_id}/{target}")
-def walkie_listen(user_id: str, target: str, last_id: str = ""):
-    msg = _walkie_p2p.get(ckey(user_id, target))
-    if not msg or msg["from"] == user_id or msg["id"] == last_id: return []
-    return [msg]
+# ═══════════════════════════════════════════════════════════════════════════════
+# 🔧 YÖNETİM FONKSİYONLARI
+# ═══════════════════════════════════════════════════════════════════════════════
 
-@app.post("/room_walkie_send")
-def room_walkie_send(data: WalkieSendModel):
-    room = data.roomName or "Genel"
-    if room not in _walkie_room: _walkie_room[room] = []
-    _walkie_room[room].append({"id":str(uuid.uuid4())[:8],"from":data.fromUser,"audio":data.audioBase64,"timestamp":now_str()})
-    _walkie_room[room] = _walkie_room[room][-10:]
-    return {"message":"✅ Gönderildi"}
-
-@app.get("/room_walkie_listen/{room_name}")
-def room_walkie_listen(room_name: str, user_id: str = "", last_id: str = ""):
-    msgs = _walkie_room.get(room_name, [])
-    if not last_id:
-        for msg in reversed(msgs):
-            if msg["from"] != user_id: return [msg]
-        return []
-    result = []
-    found = False
-    for msg in msgs:
-        if found and msg["from"] != user_id: result.append(msg)
-        if msg["id"] == last_id: found = True
-    return result
-
-# ═══════════════════════════════════════════════════════════════════
-# 🎵 MÜZİK YAYINI
-# ═══════════════════════════════════════════════════════════════════
-@app.post("/music_start")
-def music_start(data: MusicStartModel):
-    _music_status[data.roomName] = {"broadcaster":data.broadcaster,"title":data.title,"active":True}
-    _music_chunks[data.roomName] = []
-    return {"message":"✅ Başladı"}
-
-@app.post("/music_chunk")
-def music_chunk(data: MusicChunkModel):
-    room = data.roomName
-    if room not in _music_chunks: _music_chunks[room] = []
-    cid = str(uuid.uuid4())[:8]
-    _music_chunks[room].append({"id":cid,"index":data.chunkIndex,"from":data.broadcaster,"audio":data.audioBase64,"timestamp":now_str()})
-    _music_chunks[room] = _music_chunks[room][-20:]
-    return {"message":"✅ Chunk","id":cid}
-
-@app.get("/music_chunk_data/{room_name}/{chunk_id}")
-def music_chunk_data(room_name: str, chunk_id: str):
-    for c in _music_chunks.get(room_name, []):
-        if c["id"] == chunk_id: return c
-    raise HTTPException(404, "Chunk bulunamadı")
-
-@app.post("/music_stop")
-def music_stop(data: MusicStopModel):
-    if data.roomName in _music_status: _music_status[data.roomName]["active"] = False
-    _music_chunks.pop(data.roomName, None)
-    return {"message":"✅ Durduruldu"}
-
-@app.get("/music_status/{room_name}")
-def music_status(room_name: str):
-    s = _music_status.get(room_name, {"active":False,"broadcaster":None,"title":""})
-    return {"active":s.get("active",False),"broadcaster":s.get("broadcaster"),"title":s.get("title",""),"chunks":_music_chunks.get(room_name,[])}
-
-# ═══════════════════════════════════════════════════════════════════
-# 🗺️ PAYLAŞILAN ROTA
-# ═══════════════════════════════════════════════════════════════════
-@app.post("/share_route")
-def share_route(data: SharedRouteModel):
-    _shared_routes[data.roomName] = {"userId":data.userId,"points":data.points,"timestamp":now_str()}
-    return {"message":"✅ Rota paylaşıldı"}
-
-@app.get("/get_shared_route/{room_name}")
-def get_shared_route(room_name: str):
-    r = _shared_routes.get(room_name)
-    if not r: return {"active":False,"points":[],"userId":None}
-    return {"active":True,**r}
-
-@app.delete("/clear_shared_route/{room_name}")
-def clear_shared_route(room_name: str):
-    _shared_routes.pop(room_name, None)
-    return {"message":"✅ Temizlendi"}
-
-# ═══════════════════════════════════════════════════════════════════
-# 👑 MASTER ADMİN
-# ═══════════════════════════════════════════════════════════════════
-MASTER_PASSWORD = "Yuri2024!"
-
-def is_master(device_id: str): return device_id in _master_devices
-
-@app.get("/master_status")
-def master_status(device_id: str = ""):
-    return {"isMaster": is_master(device_id)}
-
-@app.get("/master_login")
-def master_login(device_id: str = "", password: str = ""):
-    if password != MASTER_PASSWORD: raise HTTPException(401, "Yanlış şifre!")
-    if device_id: _master_devices.add(device_id)
-    return {"message":"✅ Master giriş","isMaster":True}
-
-@app.post("/master_logout")
-def master_logout(device_id: str = ""):
-    _master_devices.discard(device_id)
-    return {"message":"✅ Çıkış"}
-
-@app.get("/master_get_all_users")
-def master_get_all_users(device_id: str = ""):
-    if not is_master(device_id): raise HTTPException(403, "Yetkisiz!")
-    with db() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT user_id,device_id,device_type,room_name,last_seen,idle_status,speed FROM locations")
-        return [{"userId":r["user_id"],"deviceId":r["device_id"],"deviceType":r["device_type"],
-                 "roomName":r["room_name"],"lastSeen":r["last_seen"],"idleStatus":r["idle_status"],
-                 "speed":r["speed"],"online":is_online(r["last_seen"])} for r in cur.fetchall()]
-
-@app.get("/master_get_all_rooms")
-def master_get_all_rooms(device_id: str = ""):
-    if not is_master(device_id): raise HTTPException(403, "Yetkisiz!")
-    with db() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT room_name,created_by,password FROM rooms")
-        rooms = cur.fetchall()
-        cur.execute("SELECT room_name,COUNT(*) as c FROM locations GROUP BY room_name")
-        counts = {r["room_name"]:r["c"] for r in cur.fetchall()}
-    result = [{"name":"Genel","createdBy":"system","userCount":counts.get("Genel",0),"password":None}]
-    for r in rooms:
-        result.append({"name":r["room_name"],"createdBy":r["created_by"],
-                        "userCount":counts.get(r["room_name"],0),"password":r["password"]})
-    return result
-
-@app.delete("/master_kick_user/{user_id}")
-def master_kick_user(user_id: str, device_id: str = ""):
-    if not is_master(device_id): raise HTTPException(403, "Yetkisiz!")
-    with db() as conn:
-        cur = conn.cursor()
-        cur.execute("DELETE FROM locations WHERE user_id=%s", (user_id,))
-    return {"message":f"✅ {user_id} atıldı"}
-
-@app.delete("/master_delete_room/{room_name}")
-def master_delete_room(room_name: str, device_id: str = ""):
-    if not is_master(device_id): raise HTTPException(403, "Yetkisiz!")
-    with db() as conn:
-        cur = conn.cursor()
-        cur.execute("DELETE FROM rooms WHERE room_name=%s", (room_name,))
-        cur.execute("UPDATE locations SET room_name='Genel' WHERE room_name=%s", (room_name,))
-        cur.execute("DELETE FROM pins WHERE room_name=%s", (room_name,))
-        cur.execute("DELETE FROM room_messages WHERE room_name=%s", (room_name,))
-    return {"message":f"✅ {room_name} silindi"}
-
-@app.delete("/master_clear_all")
-def master_clear_all(device_id: str = ""):
-    if not is_master(device_id): raise HTTPException(403, "Yetkisiz!")
-    with db() as conn:
-        cur = conn.cursor()
-        for t in ["locations","location_history","pins","scores","pin_collection_history","messages","room_messages"]:
-            cur.execute(f"DELETE FROM {t}")
-    return {"message":"✅ Tüm veriler silindi"}
-
-@app.get("/get_offline_users")
-def get_offline_users(admin_id: str = "", device_id: str = ""):
-    if not is_master(device_id): return []
-    with db() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT user_id,room_name,last_seen FROM locations")
-        return [{"userId":r["user_id"],"roomName":r["room_name"],"lastSeen":r["last_seen"]}
-                for r in cur.fetchall() if not is_online(r["last_seen"])]
-
-# ═══════════════════════════════════════════════════════════════════
-# 🗑️ YÖNETİM
-# ═══════════════════════════════════════════════════════════════════
 @app.delete("/remove_user/{user_id}")
 def remove_user(user_id: str):
-    with db() as conn:
-        cur = conn.cursor()
-        cur.execute("DELETE FROM locations WHERE user_id=%s", (user_id,))
-    return {"message":f"✅ {user_id} silindi"}
+    if user_id in locations:
+        del locations[user_id]
+    return {"message": f"✅ {user_id} silindi"}
 
 @app.delete("/clear")
 def clear_all():
-    with db() as conn:
-        cur = conn.cursor()
-        for t in ["locations","location_history","pins","scores","pin_collection_history","messages","room_messages"]:
-            cur.execute(f"DELETE FROM {t}")
-    return {"message":"✅ Tüm veriler silindi"}
+    locations.clear()
+    location_history.clear()
+    pins.clear()
+    scores.clear()
+    pin_collection_history.clear()
+    messages.clear()
+    room_messages.clear()
+    return {"message": "✅ Tüm veriler silindi"}
