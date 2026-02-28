@@ -975,7 +975,7 @@ def clear_shared_route(room_name: str):
 # 👑 MASTER ADMİN SİSTEMİ
 # ═══════════════════════════════════════════════════════════════════════════════
 
-MASTER_PASSWORD = "Yuri2024!"   # ← Şifreni buradan değiştirebilirsin
+MASTER_PASSWORD = "8862"   # ← Şifreni buradan değiştirebilirsin
 _master_devices = set()         # Oturum açmış cihaz ID'leri (RAM)
 
 def is_master(device_id: str) -> bool:
@@ -1059,3 +1059,4 @@ def master_clear_all(device_id: str = ""):
                   "pin_collection_history","messages","room_messages"]:
             cur.execute(f"DELETE FROM {t}")
     return {"message": "✅ Tüm veriler silindi"}
+
