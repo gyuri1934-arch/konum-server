@@ -969,3 +969,92 @@ def get_shared_route(room_name: str):
 def clear_shared_route(room_name: str):
     _shared_routes.pop(room_name, None)
     return {"message": "✅ Paylaşılan rota temizlendi"}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 👑 MASTER ADMİN SİSTEMİ
+# ═══════════════════════════════════════════════════════════════════════════════
+
+MASTER_PASSWORD = "Yürü!2025"   # ← Şifreni buradan değiştirebilirsin
+_master_devices = set()         # Oturum açmış cihaz ID'leri (RAM)
+
+def is_master(device_id: str) -> bool:
+    return device_id in _master_devices
+
+@app.get("/master_status")
+def master_status(device_id: str = ""):
+    return {"isMaster": is_master(device_id)}
+
+@app.get("/master_login")
+def master_login(device_id: str = "", password: str = ""):
+    if password != MASTER_PASSWORD:
+        raise HTTPException(401, "Yanlış şifre!")
+    if device_id:
+        _master_devices.add(device_id)
+    return {"message": "✅ Master giriş başarılı", "isMaster": True}
+
+@app.post("/master_logout")
+def master_logout(device_id: str = ""):
+    _master_devices.discard(device_id)
+    return {"message": "✅ Çıkış yapıldı"}
+
+@app.get("/master_get_all_users")
+def master_get_all_users(device_id: str = ""):
+    if not is_master(device_id):
+        raise HTTPException(403, "Yetkisiz erişim!")
+    with db() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT user_id, device_id, device_type, room_name, last_seen, idle_status, speed FROM locations")
+        return [{"userId": r["user_id"], "deviceId": r["device_id"],
+                 "deviceType": r["device_type"], "roomName": r["room_name"],
+                 "lastSeen": r["last_seen"], "idleStatus": r["idle_status"],
+                 "speed": r["speed"]} for r in cur.fetchall()]
+
+@app.get("/master_get_all_rooms")
+def master_get_all_rooms(device_id: str = ""):
+    if not is_master(device_id):
+        raise HTTPException(403, "Yetkisiz erişim!")
+    with db() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT room_name, created_by, password, created_at FROM rooms")
+        rooms_list = cur.fetchall()
+        cur.execute("SELECT room_name, COUNT(*) as c FROM locations GROUP BY room_name")
+        counts = {r["room_name"]: r["c"] for r in cur.fetchall()}
+    result = [{"name": "Genel", "createdBy": "system",
+               "userCount": counts.get("Genel", 0), "password": None}]
+    for r in rooms_list:
+        result.append({"name": r["room_name"], "createdBy": r["created_by"],
+                        "userCount": counts.get(r["room_name"], 0),
+                        "password": r["password"], "createdAt": r["created_at"]})
+    return result
+
+@app.delete("/master_kick_user/{user_id}")
+def master_kick_user(user_id: str, device_id: str = ""):
+    if not is_master(device_id):
+        raise HTTPException(403, "Yetkisiz erişim!")
+    with db() as conn:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM locations WHERE user_id=%s", (user_id,))
+    return {"message": f"✅ {user_id} atıldı"}
+
+@app.delete("/master_delete_room/{room_name}")
+def master_delete_room(room_name: str, device_id: str = ""):
+    if not is_master(device_id):
+        raise HTTPException(403, "Yetkisiz erişim!")
+    with db() as conn:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM rooms WHERE room_name=%s", (room_name,))
+        cur.execute("UPDATE locations SET room_name='Genel' WHERE room_name=%s", (room_name,))
+        cur.execute("DELETE FROM pins WHERE room_name=%s", (room_name,))
+        cur.execute("DELETE FROM room_messages WHERE room_name=%s", (room_name,))
+    return {"message": f"✅ {room_name} silindi"}
+
+@app.delete("/master_clear_all")
+def master_clear_all(device_id: str = ""):
+    if not is_master(device_id):
+        raise HTTPException(403, "Yetkisiz erişim!")
+    with db() as conn:
+        cur = conn.cursor()
+        for t in ["locations","location_history","pins","scores",
+                  "pin_collection_history","messages","room_messages"]:
+            cur.execute(f"DELETE FROM {t}")
+    return {"message": "✅ Tüm veriler silindi"}
