@@ -27,7 +27,7 @@ DATABASE_URL = os.environ.get(
 )
 
 TZ = pytz.timezone("Europe/Istanbul")
-USER_TIMEOUT       = 120
+USER_TIMEOUT       = 300   # 5 dakika — idle aralığından çok daha uzun
 IDLE_THRESHOLD     = 15
 IDLE_TIME_MINUTES  = 15
 SPEED_VEHICLE      = 30
@@ -264,6 +264,33 @@ def root():
 
 @app.get("/health")
 def health(): return {"status": "ok", "time": now_str()}
+
+@app.get("/debug_locations")
+def debug_locations():
+    """Tüm konumları göster — görünmeme sorununu debug etmek için"""
+    with db() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT user_id, room_name, last_seen, lat, lng FROM locations ORDER BY last_seen DESC")
+        rows = cur.fetchall()
+    now = datetime.now(TZ)
+    result = []
+    for r in rows:
+        try:
+            dt = TZ.localize(datetime.strptime(r["last_seen"], "%Y-%m-%d %H:%M:%S"))
+            age_sec = int((now - dt).total_seconds())
+            online = age_sec < USER_TIMEOUT
+        except:
+            age_sec = -1
+            online = False
+        result.append({
+            "userId": r["user_id"],
+            "roomName": r["room_name"],
+            "lastSeen": r["last_seen"],
+            "ageSec": age_sec,
+            "online": online,
+            "lat": r["lat"], "lng": r["lng"],
+        })
+    return result
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # 🚪 ODA YÖNETİMİ
@@ -590,7 +617,7 @@ def update_location(data: LocationModel):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @app.get("/get_locations/{room_name}")
-def get_locations(room_name: str, viewer_id: str = ""):
+def get_locations(room_name: str, viewer_id: str = "", viewer_device_id: str = ""):
     with db() as conn:
         cur = conn.cursor()
         cur.execute("SELECT * FROM locations WHERE room_name=%s", (room_name,))
@@ -602,12 +629,10 @@ def get_locations(room_name: str, viewer_id: str = ""):
     for loc in locs:
         uid = loc["user_id"]
         if uid == viewer_id: continue
+        if viewer_device_id and loc.get("device_id") == viewer_device_id: continue
         if not is_online(loc["last_seen"]): continue
         mode = vis.get(uid, "all")
         if mode == "hidden": continue
-        if mode == "room":
-            # sadece aynı odadaki viewer'a görün
-            pass
         result.append({
             "userId": uid, "deviceId": loc["device_id"],
             "lat": loc["lat"], "lng": loc["lng"],
