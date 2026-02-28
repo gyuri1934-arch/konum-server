@@ -414,6 +414,18 @@ def update_location(data: LocationModel):
                     UPDATE scores SET user_id=%s WHERE user_id=%s
                     AND NOT EXISTS (SELECT 1 FROM scores s2 WHERE s2.room_name=scores.room_name AND s2.user_id=%s)
                 """, (uid, old_uid, uid))
+                cur.execute("UPDATE pin_collection_history SET user_id=%s WHERE user_id=%s", (uid, old_uid))
+                cur.execute("UPDATE room_messages SET from_user=%s WHERE from_user=%s", (uid, old_uid))
+                cur.execute("UPDATE visibility_settings SET user_id=%s WHERE user_id=%s", (uid, old_uid))
+                # 1-1 mesajlar — conv_key yeniden hesapla
+                cur.execute("SELECT id,from_user,to_user FROM messages WHERE from_user=%s OR to_user=%s", (old_uid, old_uid))
+                for msg in cur.fetchall():
+                    nf = uid if msg["from_user"] == old_uid else msg["from_user"]
+                    nt = uid if msg["to_user"]   == old_uid else msg["to_user"]
+                    import json as _json
+                    new_key = "_".join(sorted([nf, nt]))
+                    cur.execute("UPDATE messages SET from_user=%s,to_user=%s,conv_key=%s WHERE id=%s",
+                                (nf, nt, new_key, msg["id"]))
             cur.execute("""
                 INSERT INTO device_registry (device_id,user_id) VALUES (%s,%s)
                 ON CONFLICT (device_id) DO UPDATE SET user_id=EXCLUDED.user_id
