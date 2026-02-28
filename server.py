@@ -422,7 +422,6 @@ def update_location(data: LocationModel):
                 for msg in cur.fetchall():
                     nf = uid if msg["from_user"] == old_uid else msg["from_user"]
                     nt = uid if msg["to_user"]   == old_uid else msg["to_user"]
-                    import json as _json
                     new_key = "_".join(sorted([nf, nt]))
                     cur.execute("UPDATE messages SET from_user=%s,to_user=%s,conv_key=%s WHERE id=%s",
                                 (nf, nt, new_key, msg["id"]))
