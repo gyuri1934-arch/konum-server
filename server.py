@@ -632,7 +632,15 @@ def get_offline_users(admin_id: str = "", device_id: str = ""):
     return result
 
 @app.get("/get_location_history/{user_id}")
-def get_location_history(user_id: str, period: str = "all"):
+def get_location_history(user_id: str, period: str = "all", requester_id: str = ""):
+    # Yetki kontrolü: sadece kendisi veya aynı odanın admini görebilir
+    if requester_id and requester_id != user_id:
+        # Requester'ın admin olduğu odaları bul
+        admin_rooms = {name for name, room in rooms.items() if room.get("createdBy") == requester_id}
+        # Hedef kullanıcının odasını bul
+        target_room = locations.get(user_id, {}).get("roomName", "")
+        if target_room not in admin_rooms and requester_id not in SUPER_ADMIN_IDS:
+            raise HTTPException(status_code=403, detail="Bu kullanıcının geçmişini görme yetkiniz yok")
     history = location_history.get(user_id, [])
     if period == "all":
         return history
