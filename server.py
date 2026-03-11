@@ -437,17 +437,32 @@ def respond_permission(data: PermissionRespondModel):
 
 @app.get("/get_pending_requests/{user_id}")
 def get_pending_requests(user_id: str):
-    """Admin: kendi odalarındaki bekleyen istekleri göster. Kullanıcı: kendi isteklerinin durumunu göster."""
+    """Admin: bekleyen (pending) istekleri döndür. Kullanıcı: kendi isteklerini döndür."""
     result = []
     for req in permission_requests.values():
         room_name = req["roomName"]
-        # Admin mi?
         is_admin = room_name in rooms and rooms[room_name]["createdBy"] == user_id
-        # Kendi isteği mi?
         is_own = req["requesterUserId"] == user_id
-        if is_admin or is_own:
+        if is_admin and req["status"] == "pending":
+            result.append(req)
+        elif is_own:
             result.append(req)
     return result
+
+@app.get("/get_request_result/{request_id}/{user_id}")
+def get_request_result(request_id: str, user_id: str):
+    """Kullanıcı kendi isteğinin sonucunu öğrenir."""
+    if request_id not in permission_requests:
+        raise HTTPException(status_code=404, detail="İstek bulunamadı!")
+    req = permission_requests[request_id]
+    if req["requesterUserId"] != user_id:
+        raise HTTPException(status_code=403, detail="Bu istek size ait değil!")
+    return {
+        "requestId": request_id,
+        "status": req["status"],
+        "permissionType": req["permissionType"],
+        "roomName": req["roomName"],
+    }
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # 👁️ GÖRÜNÜRLİK
