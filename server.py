@@ -52,6 +52,10 @@ sos_alerts = {}               # roomName → {userId, lat, lng, message, timesta
 # ─── Müzik yayını ───
 music_broadcasts = {}         # roomName → {broadcasterId, title, startedAt, chunks: []}
 
+# ─── Geofence bölgeleri ───
+room_geofences = {}           # roomName → [{id, name, center_lat, center_lng, radius, createdBy, createdAt}]
+geofence_entries = {}         # "userId_geofenceId" → {userId, geofenceId, entryTime, roomName}
+
 # ─── Süper admin ───
 SUPER_ADMIN_IDS = {"superadmin", "admin123"}  # İstediğin kullanıcı adlarını buraya ekle
 
@@ -1100,6 +1104,180 @@ def change_username(data: ChangeUsernameModel):
         for msg in room_msgs:
             if msg.get('from') == old: msg['from'] = new
     return {"message": f"✅ İsim değiştirildi: {old} → {new}"}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 🔵 GEOFENCE
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class GeofenceSaveModel(BaseModel):
+    roomName: str
+    adminId: str
+    geofences: list  # [{id, name, center_lat, center_lng, radius}]
+
+class GeofenceEntryModel(BaseModel):
+    roomName: str
+    userId: str
+    geofenceId: str
+    inside: bool
+
+class GeofenceRenameModel(BaseModel):
+    roomName: str
+    adminId: str
+    geofenceId: str
+    newName: str
+
+@app.post("/geofence/save")
+def geofence_save(data: GeofenceSaveModel):
+    room = rooms.get(data.roomName)
+    if not room:
+        raise HTTPException(status_code=404, detail="Oda bulunamadı")
+    if room.get("createdBy") != data.adminId:
+        raise HTTPException(status_code=403, detail="Sadece admin kaydedebilir")
+    now = datetime.now(DEFAULT_TIMEZONE).strftime("%Y-%m-%d %H:%M:%S")
+    saved = []
+    for gf in data.geofences:
+        saved.append({
+            "id":          gf["id"],
+            "name":        gf["name"],
+            "center_lat":  gf["center_lat"],
+            "center_lng":  gf["center_lng"],
+            "radius":      gf["radius"],
+            "createdBy":   data.adminId,
+            "createdAt":   gf.get("createdAt", now),
+        })
+    room_geofences[data.roomName] = saved
+    return {"message": f"✅ {len(saved)} geofence kaydedildi"}
+
+@app.get("/geofence/get/{room_name}")
+def geofence_get(room_name: str):
+    gfs = room_geofences.get(room_name, [])
+    # Entry bilgilerini de ekle
+    result = []
+    for gf in gfs:
+        entries = [
+            v for k, v in geofence_entries.items()
+            if k.endswith(f"_{gf['id']}") and v.get("roomName") == room_name
+        ]
+        result.append({**gf, "entries": entries})
+    return {"geofences": result}
+
+@app.post("/geofence/entry")
+def geofence_entry(data: GeofenceEntryModel):
+    key = f"{data.userId}_{data.geofenceId}"
+    now = datetime.now(DEFAULT_TIMEZONE).strftime("%Y-%m-%d %H:%M:%S")
+    if data.inside:
+        geofence_entries[key] = {
+            "userId":      data.userId,
+            "geofenceId":  data.geofenceId,
+            "entryTime":   now,
+            "roomName":    data.roomName,
+        }
+    else:
+        geofence_entries.pop(key, None)
+    return {"ok": True}
+
+@app.post("/geofence/rename")
+def geofence_rename(data: GeofenceRenameModel):
+    room = rooms.get(data.roomName)
+    if not room:
+        raise HTTPException(status_code=404, detail="Oda bulunamadı")
+    if room.get("createdBy") != data.adminId:
+        raise HTTPException(status_code=403, detail="Sadece admin yeniden adlandırabilir")
+    gfs = room_geofences.get(data.roomName, [])
+    for gf in gfs:
+        if gf["id"] == data.geofenceId:
+            gf["name"] = data.newName
+            return {"message": "✅ İsim güncellendi"}
+    raise HTTPException(status_code=404, detail="Geofence bulunamadı")
+
+@app.delete("/geofence/delete/{room_name}/{geofence_id}")
+def geofence_delete(room_name: str, geofence_id: str, admin_id: str):
+    room = rooms.get(room_name)
+    if not room or room.get("createdBy") != admin_id:
+        raise HTTPException(status_code=403, detail="Yetkisiz")
+    gfs = room_geofences.get(room_name, [])
+    room_geofences[room_name] = [g for g in gfs if g["id"] != geofence_id]
+    geofence_entries.pop(f"*_{geofence_id}", None)
+    for k in list(geofence_entries.keys()):
+        if k.endswith(f"_{geofence_id}"):
+            del geofence_entries[k]
+    return {"message": "✅ Silindi"}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 🗺️ GRUP ROTASI
+# ═══════════════════════════════════════════════════════════════════════════════
+
+shared_routes = {}   # roomName → {sharedBy, waypoints: [{lat,lng}], active, sharedAt}
+
+class ShareRouteModel(BaseModel):
+    roomName: str
+    sharedBy: str
+    waypoints: list   # [{lat, lng}]
+
+@app.post("/share_route")
+def share_route(data: ShareRouteModel):
+    room = rooms.get(data.roomName)
+    if not room:
+        raise HTTPException(status_code=404, detail="Oda bulunamadı")
+    now = datetime.now(DEFAULT_TIMEZONE).strftime("%Y-%m-%d %H:%M:%S")
+    shared_routes[data.roomName] = {
+        "sharedBy":  data.sharedBy,
+        "waypoints": data.waypoints,
+        "active":    True,
+        "sharedAt":  now,
+    }
+    return {"message": "✅ Rota paylaşıldı"}
+
+@app.get("/get_shared_route/{room_name}")
+def get_shared_route(room_name: str):
+    route = shared_routes.get(room_name)
+    if not route or not route.get("active"):
+        return {"active": False}
+    return {"active": True, **route}
+
+@app.delete("/clear_shared_route/{room_name}")
+def clear_shared_route(room_name: str, admin_id: str):
+    route = shared_routes.get(room_name)
+    if not route:
+        return {"message": "Rota zaten yok"}
+    room = rooms.get(room_name)
+    if room and room.get("createdBy") != admin_id:
+        raise HTTPException(status_code=403, detail="Sadece admin silebilir")
+    shared_routes[room_name] = {"active": False}
+    return {"message": "✅ Rota temizlendi"}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 👢 KULLANICI ATMA
+# ═══════════════════════════════════════════════════════════════════════════════
+
+kicked_users = {}  # userId → {roomName, kickedAt, kickedBy}
+
+@app.post("/kick_user/{room_name}/{target_user}")
+def kick_user(room_name: str, target_user: str, admin_id: str):
+    room = rooms.get(room_name)
+    if not room:
+        raise HTTPException(status_code=404, detail="Oda bulunamadı")
+    if room.get("createdBy") != admin_id:
+        raise HTTPException(status_code=403, detail="Sadece admin kullanıcı atabilir")
+    if target_user == admin_id:
+        raise HTTPException(status_code=400, detail="Kendinizi atamazsınız")
+    now = datetime.now(DEFAULT_TIMEZONE).strftime("%Y-%m-%d %H:%M:%S")
+    # Kullanıcıyı odadan çıkar
+    if target_user in locations:
+        if locations[target_user].get("roomName") == room_name:
+            locations[target_user]["roomName"] = "Genel"
+    # Kick kaydı — Flutter bu endpoint'i polling ile kontrol eder
+    kicked_users[target_user] = {"roomName": room_name, "kickedAt": now, "kickedBy": admin_id}
+    return {"message": f"✅ {target_user} odadan atıldı"}
+
+@app.get("/check_kicked/{user_id}")
+def check_kicked(user_id: str):
+    kick = kicked_users.get(user_id)
+    if not kick:
+        return {"kicked": False}
+    # Bir kez okunduktan sonra temizle
+    del kicked_users[user_id]
+    return {"kicked": True, "roomName": kick["roomName"], "kickedBy": kick["kickedBy"]}
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # 🔧 YÖNETİM
