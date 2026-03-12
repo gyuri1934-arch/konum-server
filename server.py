@@ -57,7 +57,21 @@ room_geofences = {}           # roomName → [{id, name, center_lat, center_lng,
 geofence_entries = {}         # "userId_geofenceId" → {userId, geofenceId, entryTime, roomName}
 
 # ─── Süper admin ───
-SUPER_ADMIN_IDS = {"superadmin", "admin123"}  # İstediğin kullanıcı adlarını buraya ekle
+# Süper admin cihaz ID listesi — kullanıcı adı değişse bile yetki kalır
+# Kendi cihaz ID'ni öğrenmek için uygulamada kullanıcı adına uzun bas
+SUPER_ADMIN_DEVICE_IDS: set = {
+    # "54b52711ebc9ecdce766229b0c2b5c612376de2993c6ce6aef06e133b88e5279",
+}
+
+def is_super_admin(user_id: str, device_id: str = "") -> bool:
+    """Cihaz ID'ye göre süper admin kontrolü."""
+    if device_id and device_id in SUPER_ADMIN_DEVICE_IDS:
+        return True
+    # Aktif konumdan cihaz ID'yi bul
+    loc = locations.get(user_id, {})
+    if loc.get("deviceId", "") in SUPER_ADMIN_DEVICE_IDS:
+        return True
+    return False
 
 # ─── Çevrimdışı kullanıcılar (son görülme) ───
 # locations zaten tutuyor, offline = is_user_online() == False
@@ -619,7 +633,7 @@ def get_locations(room_name: str, viewer_id: str = "", viewer_device_id: str = "
 
 @app.get("/get_offline_users")
 def get_offline_users(admin_id: str = "", device_id: str = ""):
-    if admin_id not in SUPER_ADMIN_IDS:
+    if not is_super_admin(admin_id, device_id):
         raise HTTPException(status_code=403, detail="Yetkisiz!")
     result = []
     for uid, data in locations.items():
@@ -639,7 +653,7 @@ def get_location_history(user_id: str, period: str = "all", requester_id: str = 
         admin_rooms = {name for name, room in rooms.items() if room.get("createdBy") == requester_id}
         # Hedef kullanıcının odasını bul
         target_room = locations.get(user_id, {}).get("roomName", "")
-        if target_room not in admin_rooms and requester_id not in SUPER_ADMIN_IDS:
+        if target_room not in admin_rooms and not is_super_admin(requester_id):
             raise HTTPException(status_code=403, detail="Bu kullanıcının geçmişini görme yetkiniz yok")
     history = location_history.get(user_id, [])
     if period == "all":
@@ -1042,12 +1056,12 @@ def music_chunk_data(room_name: str, chunk_id: str):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @app.get("/check_super_admin/{user_id}")
-def check_super_admin(user_id: str):
-    return {"isSuperAdmin": user_id in SUPER_ADMIN_IDS}
+def check_super_admin(user_id: str, device_id: str = ""):
+    return {"isSuperAdmin": is_super_admin(user_id, device_id)}
 
 @app.get("/get_all_rooms_info")
-def get_all_rooms_info(admin_id: str = ""):
-    if admin_id not in SUPER_ADMIN_IDS:
+def get_all_rooms_info(admin_id: str = "", device_id: str = ""):
+    if not is_super_admin(admin_id, device_id):
         raise HTTPException(status_code=403, detail="Yetkisiz!")
     result = []
     for room_name in ["Genel"] + list(rooms.keys()):
