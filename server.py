@@ -1150,6 +1150,60 @@ def change_username(data: ChangeUsernameModel):
     if old in kicked_users:
         kicked_users[new] = kicked_users.pop(old)
 
+    # ── Pinler (creator) ──────────────────────────────────────────────────────
+    for pin in pins.values():
+        if pin.get("creator") == old:
+            pin["creator"] = new
+
+    # ── Walkie kuyrukları ─────────────────────────────────────────────────────
+    for key in list(walkie_queue.keys()):
+        entry = walkie_queue[key]
+        if entry.get("from") == old:
+            entry["from"] = new
+        parts = key.split("_", 1)
+        if len(parts) == 2:
+            frm, to = parts
+            if frm == old or to == old:
+                walkie_queue.pop(key)
+                new_key = f"{new if frm == old else frm}_{new if to == old else to}"
+                walkie_queue[new_key] = entry
+    for room_queue in room_walkie_queue.values():
+        for entry in room_queue:
+            if entry.get("from") == old:
+                entry["from"] = new
+
+    # ── Sesli mesajlar ────────────────────────────────────────────────────────
+    for vm in voice_messages.values():
+        if vm.get("fromUser") == old: vm["fromUser"] = new
+        if vm.get("toUser")   == old: vm["toUser"]   = new
+    for rvm in room_voice_messages.values():
+        if rvm.get("fromUser") == old: rvm["fromUser"] = new
+
+    # ── Yetki istekleri ───────────────────────────────────────────────────────
+    for req in permission_requests.values():
+        if req.get("requesterUserId") == old:
+            req["requesterUserId"] = new
+
+    # ── SOS uyarıları ─────────────────────────────────────────────────────────
+    for alert in sos_alerts.values():
+        if alert.get("userId") == old:
+            alert["userId"] = new
+
+    # ── Müzik yayınları ───────────────────────────────────────────────────────
+    for broadcast in music_broadcasts.values():
+        if broadcast.get("broadcasterId") == old:
+            broadcast["broadcasterId"] = new
+
+    # ── Görünürlük ayarları ───────────────────────────────────────────────────
+    if old in visibility_settings:
+        visibility_settings[new] = visibility_settings.pop(old)
+    # İzin listelerinde de güncelle
+    for vs in visibility_settings.values():
+        allowed = vs.get("allowed", [])
+        if old in allowed:
+            allowed.remove(old)
+            allowed.append(new)
+
     return {"message": f"✅ İsim değiştirildi: {old} → {new}"}
 
 # ═══════════════════════════════════════════════════════════════════════════════
