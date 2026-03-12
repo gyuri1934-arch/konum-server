@@ -57,17 +57,33 @@ room_geofences = {}           # roomName → [{id, name, center_lat, center_lng,
 geofence_entries = {}         # "userId_geofenceId" → {userId, geofenceId, entryTime, roomName}
 
 # ─── Süper admin ───
-# Süper admin cihaz ID listesi — kullanıcı adı değişse bile yetki kalır
-# Kendi cihaz ID'ni öğrenmek için uygulamada kullanıcı adına uzun bas
+# ── Süper admin kimlik bilgileri ──────────────────────────────────────────────
+# Cihaz ID (sabit, değişmez) veya ID+şifre çifti ile giriş
 SUPER_ADMIN_DEVICE_IDS: set = {
-    # "a2634779254f11686dea56e2d0bcc2eab4c99f1d77e05a745b5fa7e1dd37500a",
+    # "buraya_cihaz_id_ekle",
 }
 
-def is_super_admin(user_id: str, device_id: str = "") -> bool:
-    """Cihaz ID'ye göre süper admin kontrolü."""
+# ID + şifre çiftleri — uygulamada kendi ikonuna uzun basarak giriş
+SUPER_ADMIN_CREDENTIALS: dict = {
+    "admin": "1234",       # "id": "şifre"  ← istediğin gibi değiştir
+}
+
+# Oturum tokenleri (RAM) — giriş sonrası üretilir
+_super_admin_sessions: dict = {}   # token → {userId, expiresAt}
+
+def is_super_admin(user_id: str, device_id: str = "", token: str = "") -> bool:
+    """Cihaz ID, token veya aktif konum üzerinden süper admin kontrolü."""
+    # 1. Token kontrolü
+    if token and token in _super_admin_sessions:
+        sess = _super_admin_sessions[token]
+        if datetime.now(DEFAULT_TIMEZONE) < sess["expiresAt"]:
+            return True
+        else:
+            _super_admin_sessions.pop(token, None)
+    # 2. Cihaz ID doğrudan
     if device_id and device_id in SUPER_ADMIN_DEVICE_IDS:
         return True
-    # Aktif konumdan cihaz ID'yi bul
+    # 3. Aktif konumdan cihaz ID
     loc = locations.get(user_id, {})
     if loc.get("deviceId", "") in SUPER_ADMIN_DEVICE_IDS:
         return True
@@ -638,8 +654,8 @@ def get_locations(room_name: str, viewer_id: str = "", viewer_device_id: str = "
     return result
 
 @app.get("/get_offline_users")
-def get_offline_users(admin_id: str = "", device_id: str = ""):
-    if not is_super_admin(admin_id, device_id):
+def get_offline_users(admin_id: str = "", device_id: str = "", token: str = ""):
+    if not is_super_admin(admin_id, device_id, token):
         raise HTTPException(status_code=403, detail="Yetkisiz!")
     result = []
     for uid, data in locations.items():
@@ -1062,12 +1078,43 @@ def music_chunk_data(room_name: str, chunk_id: str):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @app.get("/check_super_admin/{user_id}")
-def check_super_admin(user_id: str, device_id: str = ""):
-    return {"isSuperAdmin": is_super_admin(user_id, device_id)}
+def check_super_admin(user_id: str, device_id: str = "", token: str = ""):
+    return {"isSuperAdmin": is_super_admin(user_id, device_id, token)}
+
+@app.post("/super_admin_login")
+def super_admin_login(data: dict):
+    """ID + şifre ile süper admin girişi — token döner."""
+    admin_id = data.get("adminId", "").strip()
+    password  = data.get("password", "").strip()
+    requester = data.get("userId", "").strip()
+
+    if not admin_id or not password:
+        raise HTTPException(400, "ID ve şifre gerekli")
+    if SUPER_ADMIN_CREDENTIALS.get(admin_id) != password:
+        raise HTTPException(403, "Hatalı ID veya şifre")
+
+    # Doğru şifre girildi — admin başka bir oturumdan zaten aktif mi?
+    # (kendi isteğiyle giriş yapıyorsa izin ver)
+    if requester != admin_id:
+        now = datetime.now(DEFAULT_TIMEZONE)
+        already_online = any(
+            s["userId"] == admin_id and now < s["expiresAt"]
+            for s in _super_admin_sessions.values()
+        )
+        if already_online:
+            raise HTTPException(409, "🔒 Admin zaten online — ikinci giriş yapılamaz")
+
+    # 24 saatlik token üret
+    token = str(uuid.uuid4())
+    _super_admin_sessions[token] = {
+        "userId":    admin_id,
+        "expiresAt": datetime.now(DEFAULT_TIMEZONE) + timedelta(hours=24),
+    }
+    return {"token": token, "message": "✅ Süper admin girişi başarılı"}
 
 @app.get("/get_all_rooms_info")
-def get_all_rooms_info(admin_id: str = "", device_id: str = ""):
-    if not is_super_admin(admin_id, device_id):
+def get_all_rooms_info(admin_id: str = "", device_id: str = "", token: str = ""):
+    if not is_super_admin(admin_id, device_id, token):
         raise HTTPException(status_code=403, detail="Yetkisiz!")
     result = []
     for room_name in ["Genel"] + list(rooms.keys()):
