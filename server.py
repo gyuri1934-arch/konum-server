@@ -1,9 +1,11 @@
 # ═══════════════════════════════════════════════════════════════════════════════
 #                         KONUM TAKİP SERVER
 # ═══════════════════════════════════════════════════════════════════════════════
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from fastapi.exceptions import RequestValidationError
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from pydantic import BaseModel
 from typing import Optional, List
 from datetime import datetime, timedelta
@@ -19,6 +21,19 @@ class UnicodeJSONResponse(JSONResponse):
                           allow_nan=False, separators=(",", ":")).encode("utf-8")
 
 app = FastAPI(title="Konum Takip API", version="3.0", default_response_class=UnicodeJSONResponse)
+
+# HTTPException hata mesajları da UTF-8 olsun (Türkçe + emoji)
+@app.exception_handler(StarletteHTTPException)
+async def unicode_http_exception_handler(request: Request, exc: StarletteHTTPException):
+    return UnicodeJSONResponse(
+        status_code=exc.status_code,
+        content={"detail": exc.detail})
+
+@app.exception_handler(RequestValidationError)
+async def unicode_validation_exception_handler(request: Request, exc: RequestValidationError):
+    return UnicodeJSONResponse(
+        status_code=422,
+        content={"detail": str(exc)})
 
 app.add_middleware(
     CORSMiddleware,
@@ -1153,7 +1168,18 @@ def change_username(data: ChangeUsernameModel):
     if not new or len(new.strip()) < 1:
         raise HTTPException(status_code=400, detail="İsim boş olamaz!")
     if new in locations and new != old:
-        raise HTTPException(status_code=400, detail="Bu isim zaten kullanımda!")
+        existing = locations[new]
+        req_device   = (data.deviceId or "").strip() if hasattr(data, "deviceId") else ""
+        exist_device = existing.get("deviceId", "").strip()
+
+        same_device  = req_device and exist_device and req_device == exist_device
+        timed_out    = not is_user_online(existing.get("lastSeen", ""))
+
+        if same_device or timed_out:
+            # Aynı cihaz ya da eski oturum süresi dolmuş — eski kaydı temizle
+            locations.pop(new, None)
+        else:
+            raise HTTPException(status_code=400, detail="Bu isim zaten kullanımda!")
     if old in locations:
         locations[new] = locations.pop(old)
         locations[new]["userId"] = new
