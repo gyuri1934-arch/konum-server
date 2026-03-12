@@ -60,7 +60,7 @@ geofence_entries = {}         # "userId_geofenceId" → {userId, geofenceId, ent
 # Süper admin cihaz ID listesi — kullanıcı adı değişse bile yetki kalır
 # Kendi cihaz ID'ni öğrenmek için uygulamada kullanıcı adına uzun bas
 SUPER_ADMIN_DEVICE_IDS: set = {
-    # "6a28614fa164b06b3c51567c51112e318f375e0012d5ca83ad18a451c628a27a",
+    # "a2634779254f11686dea56e2d0bcc2eab4c99f1d77e05a745b5fa7e1dd37500a",
 }
 
 def is_super_admin(user_id: str, device_id: str = "") -> bool:
@@ -617,6 +617,11 @@ def get_locations(room_name: str, viewer_id: str = "", viewer_device_id: str = "
             viewer_room = locations.get(viewer_id, {}).get("roomName", "Genel")
             if viewer_room != data.get("roomName"):
                 continue
+        # Bu kullanıcı odanın admini mi?
+        user_room = data.get("roomName", "Genel")
+        room_data = rooms.get(user_room, {})
+        is_room_admin = room_data.get("createdBy") == uid
+
         result.append({
             "userId": uid, "deviceId": data.get("deviceId", ""),
             "lat": data["lat"], "lng": data["lng"],
@@ -628,6 +633,7 @@ def get_locations(room_name: str, viewer_id: str = "", viewer_device_id: str = "
             "idleMinutes": data.get("idleMinutes", 0),
             "character": data.get("character", "🧍"),
             "isHidden": False,
+            "isRoomAdmin": is_room_admin,
         })
     return result
 
@@ -1412,4 +1418,3 @@ def clear_all():
     voice_messages.clear(); room_voice_messages.clear()
     sos_alerts.clear(); music_broadcasts.clear(); permission_requests.clear()
     return {"message": "✅ Tüm veriler silindi"}
-
