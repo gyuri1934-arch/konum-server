@@ -669,8 +669,13 @@ def get_locations(room_name: str, viewer_id: str = "", viewer_device_id: str = "
         user_room = data.get("roomName", "Genel")
         room_data = rooms.get(user_room, {})
         # Genel oda sistem odasıdır — admin yok
-        # Diğer odalar: creator kontrolü
-        is_room_admin = bool(room_data.get("createdBy")) and room_data.get("createdBy") == uid
+        # Diğer odalar: creator veya aktif süper admin oturumu
+        is_creator    = bool(room_data.get("createdBy")) and room_data.get("createdBy") == uid
+        is_super_now  = any(
+            s["userId"] == uid and datetime.now(DEFAULT_TIMEZONE) < s["expiresAt"]
+            for s in _super_admin_sessions.values()
+        )
+        is_room_admin = is_creator or is_super_now
 
         result.append({
             "userId": uid, "deviceId": data.get("deviceId", ""),
@@ -1147,6 +1152,21 @@ def super_admin_login(data: dict):
         "expiresAt": datetime.now(DEFAULT_TIMEZONE) + timedelta(hours=24),
     }
     return {"token": token, "message": "✅ Süper admin girişi başarılı"}
+
+@app.post("/super_admin_logout")
+def super_admin_logout(data: dict):
+    """Süper admin oturumunu sonlandır"""
+    admin_id = data.get("adminId", "")
+    token    = data.get("token", "")
+    # Token varsa sil
+    if token and token in _super_admin_sessions:
+        del _super_admin_sessions[token]
+        return {"message": "✅ Admin oturumu kapatıldı"}
+    # Token yoksa adminId'ye göre temizle
+    to_delete = [t for t, s in _super_admin_sessions.items() if s["userId"] == admin_id]
+    for t in to_delete:
+        del _super_admin_sessions[t]
+    return {"message": "✅ Çıkış yapıldı"}
 
 @app.get("/get_all_rooms_info")
 def get_all_rooms_info(admin_id: str = "", device_id: str = "", token: str = ""):
