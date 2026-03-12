@@ -1541,6 +1541,14 @@ def kick_user(room_name: str, target_user: str, admin_id: str,
         raise HTTPException(status_code=403, detail="Sadece oda admini veya süper admin atabilir")
     if target_user == admin_id:
         raise HTTPException(status_code=400, detail="Kendinizi atamazsınız")
+    # Süper admin hiç kimse tarafından atılamaz
+    target_device = locations.get(target_user, {}).get("deviceId", "")
+    target_is_sadmin = any(
+        s["userId"] == target_user and datetime.now(DEFAULT_TIMEZONE) < s["expiresAt"]
+        for s in _super_admin_sessions.values()
+    )
+    if target_is_sadmin and not is_sadmin:
+        raise HTTPException(status_code=403, detail="Süper admini atamazsınız")
     # Odanın kurucusunu başkası atamaz (sadece süper admin atabilir)
     if room.get("createdBy") == target_user and not is_sadmin:
         raise HTTPException(status_code=403, detail="Oda kurucusunu atamazsınız")
