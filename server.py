@@ -1151,20 +1151,25 @@ def super_admin_login(data: dict):
     if SUPER_ADMIN_CREDENTIALS.get(admin_id) != password:
         raise HTTPException(403, "Hatalı ID veya şifre")
 
-    # Doğru şifre girildi — admin başka bir cihazdan zaten aktif oturumu var mı?
+    # Aynı admin ID ile mevcut oturum varsa iptal et (yeniden giriş izni)
     now = datetime.now(DEFAULT_TIMEZONE)
-    already_online = any(
-        s["userId"] == admin_id and now < s["expiresAt"]
-        for s in _super_admin_sessions.values()
-    )
-    if already_online:
-        raise HTTPException(409, "🔒 Admin zaten online — ikinci giriş yapılamaz")
+    requester_device = data.get("deviceId", "").strip()
+    stale_tokens = [
+        t for t, s in _super_admin_sessions.items()
+        if s["userId"] == admin_id and now < s["expiresAt"]
+    ]
+    if stale_tokens:
+        # Aynı cihaz: sessizce eski oturumu kapat ve yenile
+        # Farklı cihaz: yine de izin ver (admin kendi oturumunu devralır)
+        for t in stale_tokens:
+            del _super_admin_sessions[t]
 
     # 24 saatlik token üret
     token = str(uuid.uuid4())
     _super_admin_sessions[token] = {
         "userId":    admin_id,
         "expiresAt": datetime.now(DEFAULT_TIMEZONE) + timedelta(hours=24),
+        "deviceId":  requester_device,
     }
     return {"token": token, "message": "✅ Süper admin girişi başarılı"}
 
