@@ -416,9 +416,10 @@ def get_room_permissions(room_name: str):
     if room_name not in rooms:
         return {"admin": None, "collectors": [], "voiceAllowed": []}
     return {
-        "admin": rooms[room_name]["createdBy"],
+        "admin":      rooms[room_name]["createdBy"],
         "collectors": rooms[room_name].get("collectors", []),
         "voiceAllowed": rooms[room_name].get("voiceAllowed", []),
+        "mutedUsers": list(muted_users.keys()),
     }
 
 @app.post("/set_collector_permission/{room_name}/{target_user}")
@@ -540,6 +541,12 @@ def set_visibility(data: VisibilityModel):
 def update_location(data: LocationModel):
     uid = data.userId
     now = get_local_time()
+
+    # Banlı kullanıcı lokasyon güncelleyemesin
+    if uid in banned_users:
+        raise HTTPException(403, "⛔ Hesabınız banlanmıştır")
+    if data.deviceId and data.deviceId in banned_devices:
+        raise HTTPException(403, "⛔ Cihazınız banlanmıştır")
 
     idle_status = "online"
     idle_minutes = 0
@@ -766,6 +773,8 @@ def get_collection_history(room_name: str, user_id: str):
 
 @app.post("/send_message")
 def send_message(data: MessageModel):
+    if data.fromUser in muted_users:
+        raise HTTPException(403, "🔇 Mesaj gönderme yetkiniz kaldırılmıştır")
     key = get_conv_key(data.fromUser, data.toUser)
     if key not in messages:
         messages[key] = []
@@ -804,6 +813,8 @@ def get_unread_count(user_id: str):
 
 @app.post("/send_room_message")
 def send_room_message(data: RoomMessageModel):
+    if data.fromUser in muted_users:
+        raise HTTPException(403, "🔇 Mesaj gönderme yetkiniz kaldırılmıştır")
     room = data.roomName
     if room != "Genel" and room not in rooms:
         raise HTTPException(status_code=404, detail="Oda bulunamadı!")
@@ -1252,6 +1263,9 @@ def change_username(data: ChangeUsernameModel):
     # ── Atılma kaydı ──────────────────────────────────────────────────────────
     if old in kicked_users:
         kicked_users[new] = kicked_users.pop(old)
+    # ── Susturma kaydı ────────────────────────────────────────────────────────
+    if old in muted_users:
+        muted_users[new] = muted_users.pop(old)
 
     # ── Pinler (creator) ──────────────────────────────────────────────────────
     for pin in pins.values():
@@ -1454,7 +1468,10 @@ def clear_shared_route(room_name: str, admin_id: str):
 # 👢 KULLANICI ATMA
 # ═══════════════════════════════════════════════════════════════════════════════
 
-kicked_users = {}  # userId → {roomName, kickedAt, kickedBy}
+kicked_users = {}   # userId → {roomName, kickedAt, kickedBy}
+banned_users  = {}  # userId → {bannedAt, bannedBy, reason, deviceId}
+banned_devices = {} # deviceId → {bannedAt, bannedBy, reason}
+muted_users   = {}  # userId → {mutedAt, mutedBy, reason}  (süper admin susturma)
 
 @app.post("/kick_user/{room_name}/{target_user}")
 def kick_user(room_name: str, target_user: str, admin_id: str):
@@ -1473,6 +1490,136 @@ def kick_user(room_name: str, target_user: str, admin_id: str):
     # Kick kaydı — Flutter bu endpoint'i polling ile kontrol eder
     kicked_users[target_user] = {"roomName": room_name, "kickedAt": now, "kickedBy": admin_id}
     return {"message": f"✅ {target_user} odadan atıldı"}
+
+@app.post("/super_admin_ban")
+def super_admin_ban(data: dict):
+    """Süper admin: kullanıcıyı banla (uygulamadan at + tekrar girişi engelle)"""
+    admin_id  = data.get("adminId", "")
+    token     = data.get("token", "")
+    device_id = data.get("deviceId", "")
+    target    = data.get("targetUser", "").strip()
+    reason    = data.get("reason", "Süper admin kararı").strip()
+
+    if not is_super_admin(admin_id, device_id, token):
+        raise HTTPException(403, "Yetkisiz")
+    if not target:
+        raise HTTPException(400, "Hedef kullanıcı belirtilmedi")
+    if target == admin_id:
+        raise HTTPException(400, "Kendinizi banlayamazsınız")
+
+    now = datetime.now(DEFAULT_TIMEZONE).strftime("%Y-%m-%d %H:%M:%S")
+    target_device = locations.get(target, {}).get("deviceId", "")
+
+    # Ban kaydı
+    banned_users[target] = {
+        "bannedAt": now, "bannedBy": admin_id,
+        "reason": reason, "deviceId": target_device,
+    }
+    if target_device:
+        banned_devices[target_device] = {
+            "bannedAt": now, "bannedBy": admin_id, "reason": reason,
+        }
+
+    # Kullanıcıyı lokasyondan sil → haritadan kaybolur
+    locations.pop(target, None)
+
+    # Kick sinyali gönder (client polling ile alır)
+    kicked_users[target] = {
+        "roomName": locations.get(target, {}).get("roomName", "Genel"),
+        "kickedAt": now, "kickedBy": f"⛔ BAN: {admin_id}",
+    }
+    return {"message": f"⛔ {target} banlandı"}
+
+@app.post("/super_admin_unban")
+def super_admin_unban(data: dict):
+    """Süper admin: banı kaldır"""
+    admin_id  = data.get("adminId", "")
+    token     = data.get("token", "")
+    device_id = data.get("deviceId", "")
+    target    = data.get("targetUser", "").strip()
+
+    if not is_super_admin(admin_id, device_id, token):
+        raise HTTPException(403, "Yetkisiz")
+
+    device = banned_users.get(target, {}).get("deviceId", "")
+    banned_users.pop(target, None)
+    if device:
+        banned_devices.pop(device, None)
+    return {"message": f"✅ {target} banı kaldırıldı"}
+
+@app.post("/super_admin_mute")
+def super_admin_mute(data: dict):
+    """Süper admin: kullanıcıyı sustur (mesaj + ses yetkileri kaldır)"""
+    admin_id  = data.get("adminId", "")
+    token     = data.get("token", "")
+    device_id = data.get("deviceId", "")
+    target    = data.get("targetUser", "").strip()
+    reason    = data.get("reason", "Süper admin kararı").strip()
+
+    if not is_super_admin(admin_id, device_id, token):
+        raise HTTPException(403, "Yetkisiz")
+    if not target:
+        raise HTTPException(400, "Hedef kullanıcı belirtilmedi")
+
+    now = datetime.now(DEFAULT_TIMEZONE).strftime("%Y-%m-%d %H:%M:%S")
+    muted_users[target] = {"mutedAt": now, "mutedBy": admin_id, "reason": reason}
+
+    # Tüm odalardaki ses yetkisini de kaldır
+    for room in rooms.values():
+        va = room.get("voiceAllowed", [])
+        if target in va:
+            va.remove(target)
+    return {"message": f"🔇 {target} susturuldu"}
+
+@app.post("/super_admin_unmute")
+def super_admin_unmute(data: dict):
+    """Süper admin: susturmayı kaldır"""
+    admin_id  = data.get("adminId", "")
+    token     = data.get("token", "")
+    device_id = data.get("deviceId", "")
+    target    = data.get("targetUser", "").strip()
+
+    if not is_super_admin(admin_id, device_id, token):
+        raise HTTPException(403, "Yetkisiz")
+    muted_users.pop(target, None)
+    return {"message": f"🔊 {target} susturması kaldırıldı"}
+
+@app.post("/super_admin_kick")
+def super_admin_kick(data: dict):
+    """Süper admin: kullanıcıyı bulunduğu odadan at"""
+    admin_id  = data.get("adminId", "")
+    token     = data.get("token", "")
+    device_id = data.get("deviceId", "")
+    target    = data.get("targetUser", "").strip()
+
+    if not is_super_admin(admin_id, device_id, token):
+        raise HTTPException(403, "Yetkisiz")
+    if not target:
+        raise HTTPException(400, "Hedef kullanıcı belirtilmedi")
+
+    now = datetime.now(DEFAULT_TIMEZONE).strftime("%Y-%m-%d %H:%M:%S")
+    room = locations.get(target, {}).get("roomName", "Genel")
+
+    if room == "Genel":
+        raise HTTPException(400, f"{target} zaten Genel odada")
+
+    # Odadan Genel'e taşı
+    if target in locations:
+        locations[target]["roomName"] = "Genel"
+
+    # Kick sinyali
+    kicked_users[target] = {"roomName": room, "kickedAt": now, "kickedBy": f"⚡ {admin_id}"}
+    return {"message": f"🚪 {target} odadan atıldı ({room})"}
+
+@app.get("/check_muted/{user_id}")
+def check_muted(user_id: str):
+    return {"muted": user_id in muted_users}
+
+@app.get("/get_banned_users")
+def get_banned_users(admin_id: str = "", device_id: str = "", token: str = ""):
+    if not is_super_admin(admin_id, device_id, token):
+        raise HTTPException(403, "Yetkisiz")
+    return [{"userId": uid, **info} for uid, info in banned_users.items()]
 
 @app.get("/check_kicked/{user_id}")
 def check_kicked(user_id: str):
