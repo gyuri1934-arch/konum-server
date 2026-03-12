@@ -60,7 +60,7 @@ geofence_entries = {}         # "userId_geofenceId" → {userId, geofenceId, ent
 # ── Süper admin kimlik bilgileri ──────────────────────────────────────────────
 # Cihaz ID (sabit, değişmez) veya ID+şifre çifti ile giriş
 SUPER_ADMIN_DEVICE_IDS: set = {
-    # "buraya_cihaz_id_ekle",
+    # "b709e2e4834d9f3f11249fdba6a9b553a0cda296717e94b44f2ba3bebb21c519",
 }
 
 # ID + şifre çiftleri — uygulamada kendi ikonuna uzun basarak giriş
@@ -1465,3 +1465,4 @@ def clear_all():
     voice_messages.clear(); room_voice_messages.clear()
     sos_alerts.clear(); music_broadcasts.clear(); permission_requests.clear()
     return {"message": "✅ Tüm veriler silindi"}
+
