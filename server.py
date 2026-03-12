@@ -79,6 +79,7 @@ music_broadcasts = {}         # roomName → {broadcasterId, title, startedAt, c
 
 # ─── Geofence bölgeleri ───
 room_geofences = {}           # roomName → [{id, name, center_lat, center_lng, radius, createdBy, createdAt}]
+user_geofences: dict = {}  # userId → [{id, name, center_lat, ...}]
 geofence_entries = {}         # "userId_geofenceId" → {userId, geofenceId, entryTime, roomName}
 
 # ─── Süper admin ───
@@ -704,6 +705,7 @@ def get_locations(room_name: str, viewer_id: str = "", viewer_device_id: str = "
             "character": data.get("character", "🧍"),
             "isHidden": False,
             "isRoomAdmin": is_room_admin,
+            "isSuperAdmin": is_super_now,  # Sadece aktif süper admin oturumu varsa true
         })
     return result
 
@@ -1409,8 +1411,9 @@ def geofence_save(data: GeofenceSaveModel):
     room = rooms.get(data.roomName)
     if not room:
         raise HTTPException(status_code=404, detail="Oda bulunamadı")
-    if room.get("createdBy") != data.adminId:
-        raise HTTPException(status_code=403, detail="Sadece admin kaydedebilir")
+    is_sadmin = is_super_admin(data.adminId, "", "")
+    if room.get("createdBy") != data.adminId and not is_sadmin:
+        raise HTTPException(status_code=403, detail="Sadece oda admini veya süper admin kaydedebilir")
     now = datetime.now(DEFAULT_TIMEZONE).strftime("%Y-%m-%d %H:%M:%S")
     saved = []
     for gf in data.geofences:
@@ -1454,13 +1457,82 @@ def geofence_entry(data: GeofenceEntryModel):
         geofence_entries.pop(key, None)
     return {"ok": True}
 
+# ─── Kişisel Geofence (kullanıcı bazlı, gizli) ───────────────────────────────
+
+@app.post("/geofence/personal/save")
+def personal_geofence_save(data: dict):
+    """Kullanıcı kendi kişisel geofence'lerini kaydeder — sadece kendisi görür"""
+    user_id    = data.get("userId", "").strip()
+    geofences  = data.get("geofences", [])
+    if not user_id:
+        raise HTTPException(400, "userId gerekli")
+    now = datetime.now(DEFAULT_TIMEZONE).strftime("%Y-%m-%d %H:%M:%S")
+    saved = []
+    for gf in geofences:
+        saved.append({
+            "id":         gf.get("id", str(uuid.uuid4())[:8]),
+            "name":       gf.get("name", "Bölgem"),
+            "center_lat": float(gf.get("center_lat", 0)),
+            "center_lng": float(gf.get("center_lng", 0)),
+            "radius":     float(gf.get("radius", 100)),
+            "threshold":  int(gf.get("threshold", 0)),
+            "createdAt":  gf.get("createdAt", now),
+        })
+    user_geofences[user_id] = saved
+    return {"message": f"✅ {len(saved)} kişisel geofence kaydedildi"}
+
+@app.get("/geofence/personal/get/{user_id}")
+def personal_geofence_get(user_id: str, requester: str = ""):
+    """Sadece sahibi veya süper admin görebilir"""
+    if requester != user_id and not any(
+        s["userId"] == requester and datetime.now(DEFAULT_TIMEZONE) < s["expiresAt"]
+        for s in _super_admin_sessions.values()
+    ):
+        raise HTTPException(403, "Yetkisiz")
+    return {"geofences": user_geofences.get(user_id, [])}
+
+@app.delete("/geofence/personal/delete/{user_id}/{geofence_id}")
+def personal_geofence_delete(user_id: str, geofence_id: str, requester: str = ""):
+    """Sadece sahibi silebilir"""
+    if requester != user_id:
+        raise HTTPException(403, "Sadece sahibi silebilir")
+    gfs = user_geofences.get(user_id, [])
+    user_geofences[user_id] = [g for g in gfs if g["id"] != geofence_id]
+    return {"message": "✅ Silindi"}
+
+@app.post("/geofence/personal/rename")
+def personal_geofence_rename(data: dict):
+    user_id     = data.get("userId", "")
+    geofence_id = data.get("geofenceId", "")
+    new_name    = data.get("newName", "")
+    if not user_id or not geofence_id:
+        raise HTTPException(400, "Eksik parametre")
+    gfs = user_geofences.get(user_id, [])
+    for gf in gfs:
+        if gf["id"] == geofence_id:
+            gf["name"] = new_name
+            return {"message": "✅ İsim güncellendi"}
+    raise HTTPException(404, "Geofence bulunamadı")
+
+@app.post("/geofence/personal/threshold")
+def personal_geofence_threshold(data: dict):
+    user_id     = data.get("userId", "")
+    geofence_id = data.get("geofenceId", "")
+    threshold   = int(data.get("threshold", 0))
+    gfs = user_geofences.get(user_id, [])
+    for gf in gfs:
+        if gf["id"] == geofence_id:
+            gf["threshold"] = threshold
+            return {"message": "✅ Kota güncellendi"}
+    raise HTTPException(404, "Geofence bulunamadı")
+
 @app.post("/geofence/rename")
 def geofence_rename(data: GeofenceRenameModel):
     room = rooms.get(data.roomName)
     if not room:
         raise HTTPException(status_code=404, detail="Oda bulunamadı")
-    if room.get("createdBy") != data.adminId:
-        raise HTTPException(status_code=403, detail="Sadece admin yeniden adlandırabilir")
+    if room.get("createdBy") != data.adminId and not is_super_admin(data.adminId, "", ""):
+        raise HTTPException(status_code=403, detail="Sadece oda admini veya süper admin yeniden adlandırabilir")
     gfs = room_geofences.get(data.roomName, [])
     for gf in gfs:
         if gf["id"] == data.geofenceId:
@@ -1471,7 +1543,7 @@ def geofence_rename(data: GeofenceRenameModel):
 @app.delete("/geofence/delete/{room_name}/{geofence_id}")
 def geofence_delete(room_name: str, geofence_id: str, admin_id: str):
     room = rooms.get(room_name)
-    if not room or room.get("createdBy") != admin_id:
+    if not room or (room.get("createdBy") != admin_id and not is_super_admin(admin_id, "", "")):
         raise HTTPException(status_code=403, detail="Yetkisiz")
     gfs = room_geofences.get(room_name, [])
     room_geofences[room_name] = [g for g in gfs if g["id"] != geofence_id]
