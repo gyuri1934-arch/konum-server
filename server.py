@@ -1111,6 +1111,45 @@ def change_username(data: ChangeUsernameModel):
     for room_msgs in room_messages.values():
         for msg in room_msgs:
             if msg.get('from') == old: msg['from'] = new
+
+    # ── Oda admin yetkisi ──────────────────────────────────────────────────────
+    for room in rooms.values():
+        if room.get("createdBy") == old:
+            room["createdBy"] = new
+        # Pin toplama yetkisi
+        collectors = room.get("collectors", [])
+        if old in collectors:
+            collectors.remove(old)
+            collectors.append(new)
+        # Ses yetkisi
+        voice = room.get("voiceAllowed", [])
+        if old in voice:
+            voice.remove(old)
+            voice.append(new)
+
+    # ── Geofence giriş kayıtları ───────────────────────────────────────────────
+    for key in list(geofence_entries.keys()):
+        entry = geofence_entries[key]
+        if entry.get("userId") == old:
+            geofence_entries.pop(key)
+            entry["userId"] = new
+            new_key = f"{new}_{entry['geofenceId']}"
+            geofence_entries[new_key] = entry
+
+    # ── Geofence bölge oluşturanı güncelle ────────────────────────────────────
+    for gf_list in room_geofences.values():
+        for gf in gf_list:
+            if gf.get("createdBy") == old:
+                gf["createdBy"] = new
+
+    # ── FCM token ─────────────────────────────────────────────────────────────
+    if old in fcm_tokens:
+        fcm_tokens[new] = fcm_tokens.pop(old)
+
+    # ── Atılma kaydı ──────────────────────────────────────────────────────────
+    if old in kicked_users:
+        kicked_users[new] = kicked_users.pop(old)
+
     return {"message": f"✅ İsim değiştirildi: {old} → {new}"}
 
 # ═══════════════════════════════════════════════════════════════════════════════
