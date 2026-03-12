@@ -3,14 +3,22 @@
 # ═══════════════════════════════════════════════════════════════════════════════
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from typing import Optional, List
 from datetime import datetime, timedelta
 from math import radians, sin, cos, sqrt, atan2
 import pytz
 import uuid
+import json
 
-app = FastAPI(title="Konum Takip API", version="3.0")
+# Türkçe karakter ve emoji desteği için ensure_ascii=False
+class UnicodeJSONResponse(JSONResponse):
+    def render(self, content) -> bytes:
+        return json.dumps(content, ensure_ascii=False,
+                          allow_nan=False, separators=(",", ":")).encode("utf-8")
+
+app = FastAPI(title="Konum Takip API", version="3.0", default_response_class=UnicodeJSONResponse)
 
 app.add_middleware(
     CORSMiddleware,
@@ -60,7 +68,7 @@ geofence_entries = {}         # "userId_geofenceId" → {userId, geofenceId, ent
 # ── Süper admin kimlik bilgileri ──────────────────────────────────────────────
 # Cihaz ID (sabit, değişmez) veya ID+şifre çifti ile giriş
 SUPER_ADMIN_DEVICE_IDS: set = {
-    # "b709e2e4834d9f3f11249fdba6a9b553a0cda296717e94b44f2ba3bebb21c519",
+    # "buraya_cihaz_id_ekle",
 }
 
 # ID + şifre çiftleri — uygulamada kendi ikonuna uzun basarak giriş
@@ -1093,16 +1101,14 @@ def super_admin_login(data: dict):
     if SUPER_ADMIN_CREDENTIALS.get(admin_id) != password:
         raise HTTPException(403, "Hatalı ID veya şifre")
 
-    # Doğru şifre girildi — admin başka bir oturumdan zaten aktif mi?
-    # (kendi isteğiyle giriş yapıyorsa izin ver)
-    if requester != admin_id:
-        now = datetime.now(DEFAULT_TIMEZONE)
-        already_online = any(
-            s["userId"] == admin_id and now < s["expiresAt"]
-            for s in _super_admin_sessions.values()
-        )
-        if already_online:
-            raise HTTPException(409, "🔒 Admin zaten online — ikinci giriş yapılamaz")
+    # Doğru şifre girildi — admin başka bir cihazdan zaten aktif oturumu var mı?
+    now = datetime.now(DEFAULT_TIMEZONE)
+    already_online = any(
+        s["userId"] == admin_id and now < s["expiresAt"]
+        for s in _super_admin_sessions.values()
+    )
+    if already_online:
+        raise HTTPException(409, "🔒 Admin zaten online — ikinci giriş yapılamaz")
 
     # 24 saatlik token üret
     token = str(uuid.uuid4())
@@ -1465,4 +1471,3 @@ def clear_all():
     voice_messages.clear(); room_voice_messages.clear()
     sos_alerts.clear(); music_broadcasts.clear(); permission_requests.clear()
     return {"message": "✅ Tüm veriler silindi"}
-
