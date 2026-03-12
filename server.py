@@ -16,6 +16,8 @@ import json
 
 # Türkçe karakter ve emoji desteği için ensure_ascii=False
 class UnicodeJSONResponse(JSONResponse):
+    media_type = "application/json; charset=utf-8"
+
     def render(self, content) -> bytes:
         return json.dumps(content, ensure_ascii=False,
                           allow_nan=False, separators=(",", ":")).encode("utf-8")
@@ -659,7 +661,9 @@ def get_locations(room_name: str, viewer_id: str = "", viewer_device_id: str = "
         # Bu kullanıcı odanın admini mi?
         user_room = data.get("roomName", "Genel")
         room_data = rooms.get(user_room, {})
-        is_room_admin = room_data.get("createdBy") == uid
+        # Genel oda sistem odasıdır — admin yok
+        # Diğer odalar: creator kontrolü
+        is_room_admin = bool(room_data.get("createdBy")) and room_data.get("createdBy") == uid
 
         result.append({
             "userId": uid, "deviceId": data.get("deviceId", ""),
