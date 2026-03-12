@@ -201,7 +201,10 @@ class RoomModel(BaseModel):
 
 class JoinRoomModel(BaseModel):
     roomName: str
-    password: str
+    password: str = ""
+    adminId:  str = ""
+    token:    str = ""
+    deviceId: str = ""
 
 class PinModel(BaseModel):
     roomName: str
@@ -334,6 +337,9 @@ def join_room(data: JoinRoomModel):
         return {"message": "Genel odaya katıldınız"}
     if data.roomName not in rooms:
         raise HTTPException(status_code=404, detail="Oda bulunamadı!")
+    # Süper admin şifresiz girebilir
+    if is_super_admin(data.adminId, data.deviceId, data.token):
+        return {"message": f"✅ {data.roomName} odasına katıldınız (admin)"}
     if rooms[data.roomName]["password"] != data.password:
         raise HTTPException(status_code=401, detail="Yanlış şifre!")
     return {"message": f"✅ {data.roomName} odasına katıldınız"}
@@ -542,11 +548,10 @@ def update_location(data: LocationModel):
     uid = data.userId
     now = get_local_time()
 
-    # Banlı kullanıcı lokasyon güncelleyemesin
-    if uid in banned_users:
-        raise HTTPException(403, "⛔ Hesabınız banlanmıştır")
-    if data.deviceId and data.deviceId in banned_devices:
-        raise HTTPException(403, "⛔ Cihazınız banlanmıştır")
+    # Banlı kullanıcı sadece Genel odada kalabilir
+    if uid in banned_users or (data.deviceId and data.deviceId in banned_devices):
+        # Konumu güncelle ama odayı Genel'e kilitle
+        data.roomName = "Genel"
 
     idle_status = "online"
     idle_minutes = 0
@@ -651,12 +656,22 @@ def update_location(data: LocationModel):
 @app.get("/get_locations/{room_name}")
 def get_locations(room_name: str, viewer_id: str = "", viewer_device_id: str = ""):
     result = []
+    # Banlı viewer sadece diğer banlı kullanıcıları görebilir
+    viewer_is_banned = viewer_id in banned_users or (
+        viewer_device_id and viewer_device_id in banned_devices
+    )
     for uid, data in locations.items():
         if uid == viewer_id:
             continue
         if not is_user_online(data.get("lastSeen", "")):
             continue
         if data.get("roomName") != room_name:
+            continue
+        # Banlı viewer sadece banlıları görür; banlı kullanıcılar normal kullanıcılara görünmez
+        uid_is_banned = uid in banned_users
+        if viewer_is_banned and not uid_is_banned:
+            continue
+        if not viewer_is_banned and uid_is_banned:
             continue
         vis = visibility_settings.get(uid, {"mode": "all"})
         if vis["mode"] == "hidden":
@@ -1174,12 +1189,32 @@ def get_all_rooms_info(admin_id: str = "", device_id: str = "", token: str = "")
         raise HTTPException(status_code=403, detail="Yetkisiz!")
     result = []
     for room_name in ["Genel"] + list(rooms.keys()):
+        room_data = rooms.get(room_name, {})
+        room_admin = room_data.get("createdBy")
         online = [u for u in locations.values()
                   if u.get("roomName") == room_name and is_user_online(u.get("lastSeen", ""))]
+        # Her kullanıcının oda admini olup olmadığını işaretle
+        user_list = []
+        for u in online:
+            uid = u["userId"]
+            # Bu kullanıcı başka bir odanın admini mi?
+            is_room_creator = any(
+                r.get("createdBy") == uid
+                for r in rooms.values()
+            )
+            user_list.append({
+                "userId":    uid,
+                "character": u.get("character", "🧍"),
+                "isAdmin":   uid == room_admin,
+                "isCreator": is_room_creator,
+                "isHidden":  False,
+            })
         result.append({
-            "roomName": room_name,
+            "roomName":    room_name,
             "onlineCount": len(online),
-            "users": [u["userId"] for u in online],
+            "roomAdmin":   room_admin,
+            "hasPassword": bool(room_data.get("password")),
+            "users":       user_list,
         })
     return result
 
@@ -1494,20 +1529,25 @@ banned_devices = {} # deviceId → {bannedAt, bannedBy, reason}
 muted_users   = {}  # userId → {mutedAt, mutedBy, reason}  (süper admin susturma)
 
 @app.post("/kick_user/{room_name}/{target_user}")
-def kick_user(room_name: str, target_user: str, admin_id: str):
+def kick_user(room_name: str, target_user: str, admin_id: str,
+              token: str = "", device_id: str = ""):
     room = rooms.get(room_name)
     if not room:
         raise HTTPException(status_code=404, detail="Oda bulunamadı")
-    if room.get("createdBy") != admin_id:
-        raise HTTPException(status_code=403, detail="Sadece admin kullanıcı atabilir")
+    # Oda kurucusu VEYA süper admin atabilir
+    is_creator   = room.get("createdBy") == admin_id
+    is_sadmin    = is_super_admin(admin_id, device_id, token)
+    if not is_creator and not is_sadmin:
+        raise HTTPException(status_code=403, detail="Sadece oda admini veya süper admin atabilir")
     if target_user == admin_id:
         raise HTTPException(status_code=400, detail="Kendinizi atamazsınız")
+    # Odanın kurucusunu başkası atamaz (sadece süper admin atabilir)
+    if room.get("createdBy") == target_user and not is_sadmin:
+        raise HTTPException(status_code=403, detail="Oda kurucusunu atamazsınız")
     now = datetime.now(DEFAULT_TIMEZONE).strftime("%Y-%m-%d %H:%M:%S")
-    # Kullanıcıyı odadan çıkar
     if target_user in locations:
         if locations[target_user].get("roomName") == room_name:
             locations[target_user]["roomName"] = "Genel"
-    # Kick kaydı — Flutter bu endpoint'i polling ile kontrol eder
     kicked_users[target_user] = {"roomName": room_name, "kickedAt": now, "kickedBy": admin_id}
     return {"message": f"✅ {target_user} odadan atıldı"}
 
@@ -1540,12 +1580,13 @@ def super_admin_ban(data: dict):
             "bannedAt": now, "bannedBy": admin_id, "reason": reason,
         }
 
-    # Kullanıcıyı lokasyondan sil → haritadan kaybolur
-    locations.pop(target, None)
+    # Kullanıcıyı Genel'e taşı (lokasyonda kalır ama sadece diğer banlıları görür)
+    if target in locations:
+        locations[target]["roomName"] = "Genel"
 
-    # Kick sinyali gönder (client polling ile alır)
+    # Kick sinyali → Flutter "⛔ BAN" içerdiğinde banlı moduna geçer
     kicked_users[target] = {
-        "roomName": locations.get(target, {}).get("roomName", "Genel"),
+        "roomName": "Genel",
         "kickedAt": now, "kickedBy": f"⛔ BAN: {admin_id}",
     }
     return {"message": f"⛔ {target} banlandı"}
@@ -1648,7 +1689,13 @@ def check_kicked(user_id: str):
         return {"kicked": False}
     # Bir kez okunduktan sonra temizle
     del kicked_users[user_id]
-    return {"kicked": True, "roomName": kick["roomName"], "kickedBy": kick["kickedBy"]}
+    is_ban = "BAN" in str(kick.get("kickedBy", ""))
+    return {
+        "kicked":   True,
+        "isBan":    is_ban,
+        "roomName": kick["roomName"],
+        "kickedBy": kick["kickedBy"],
+    }
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # 🔧 YÖNETİM
