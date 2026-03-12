@@ -60,7 +60,7 @@ geofence_entries = {}         # "userId_geofenceId" → {userId, geofenceId, ent
 # Süper admin cihaz ID listesi — kullanıcı adı değişse bile yetki kalır
 # Kendi cihaz ID'ni öğrenmek için uygulamada kullanıcı adına uzun bas
 SUPER_ADMIN_DEVICE_IDS: set = {
-    # "54b52711ebc9ecdce766229b0c2b5c612376de2993c6ce6aef06e133b88e5279",
+    # "6a28614fa164b06b3c51567c51112e318f375e0012d5ca83ad18a451c628a27a",
 }
 
 def is_super_admin(user_id: str, device_id: str = "") -> bool:
@@ -1412,3 +1412,4 @@ def clear_all():
     voice_messages.clear(); room_voice_messages.clear()
     sos_alerts.clear(); music_broadcasts.clear(); permission_requests.clear()
     return {"message": "✅ Tüm veriler silindi"}
+
