@@ -13,6 +13,8 @@ from math import radians, sin, cos, sqrt, atan2
 import pytz
 import uuid
 import json
+import os
+import asyncio
 
 # Türkçe karakter ve emoji desteği için ensure_ascii=False
 class UnicodeJSONResponse(JSONResponse):
@@ -24,7 +26,6 @@ class UnicodeJSONResponse(JSONResponse):
 
 app = FastAPI(title="Konum Takip API", version="3.0", default_response_class=UnicodeJSONResponse)
 
-# HTTPException hata mesajları da UTF-8 olsun (Türkçe + emoji)
 @app.exception_handler(StarletteHTTPException)
 async def unicode_http_exception_handler(request: Request, exc: StarletteHTTPException):
     return UnicodeJSONResponse(
@@ -46,7 +47,54 @@ app.add_middleware(
 )
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 💾 VERİ SAKLAMASI (RAM)
+# 💾 DISK KALICILIĞI — Fly.io volume /data'ya mount edilmişse persist eder
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_DATA_DIR    = "/data" if os.path.isdir("/data") else os.path.dirname(os.path.abspath(__file__))
+HISTORY_FILE = os.path.join(_DATA_DIR, "location_history.json")
+_save_pending = False
+
+def _flush_history():
+    """location_history'yi diske yaz."""
+    try:
+        os.makedirs(_DATA_DIR, exist_ok=True)
+        with open(HISTORY_FILE, 'w', encoding='utf-8') as f:
+            json.dump(location_history, f, ensure_ascii=False)
+    except Exception as e:
+        print(f"❌ History kayıt hatası: {e}")
+
+async def _periodic_save():
+    """Her 60 saniyede bir bekleyen kayıt varsa diske yaz."""
+    global _save_pending
+    while True:
+        await asyncio.sleep(60)
+        if _save_pending:
+            _flush_history()
+            _save_pending = False
+
+@app.on_event("startup")
+async def startup_event():
+    global location_history
+    try:
+        if os.path.exists(HISTORY_FILE):
+            with open(HISTORY_FILE, 'r', encoding='utf-8') as f:
+                loaded = json.load(f)
+                location_history.update(loaded)
+            total_pts = sum(len(v) for v in location_history.values())
+            print(f"✅ Geçmiş yüklendi: {len(location_history)} kullanıcı, {total_pts} nokta")
+        else:
+            print("ℹ️ Geçmiş dosyası yok — temiz başlangıç")
+    except Exception as e:
+        print(f"❌ Geçmiş yükleme hatası: {e}")
+    asyncio.create_task(_periodic_save())
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    print("💾 Kapatılıyor — geçmiş kaydediliyor...")
+    _flush_history()
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 🗄️ VERİ SAKLAMASI (RAM)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 locations = {}
@@ -58,88 +106,87 @@ pins = {}
 messages = {}
 room_messages = {}
 visibility_settings = {}
-fcm_tokens = {}               # userId → fcm token
+fcm_tokens = {}
 
-# ─── Walkie-talkie (RAM kuyruk) ───
-walkie_queue = {}             # "fromUser_toUser" → {"id", "audioBase64", "from"}
-room_walkie_queue = {}        # roomName → list of {"id", "from", "audioBase64"}
+# ─── Walkie-talkie (RAM kuyruk) ───────────────────────────────────────────────
+walkie_queue = {}
+room_walkie_queue = {}
 
-# ─── Sesli mesajlar ───
-voice_messages = {}           # voiceId → {"audioBase64", "fromUser", "toUser", "durationSeconds", "timestamp"}
-room_voice_messages = {}      # voiceId → {"audioBase64", "fromUser", "roomName", "durationSeconds", "timestamp"}
+# ─── Sesli mesajlar ───────────────────────────────────────────────────────────
+voice_messages = {}
+room_voice_messages = {}
 
-# ─── Yetki istekleri ───
-permission_requests = {}      # requestId → {roomName, requesterUserId, permissionType, message, status, timestamp}
+# ─── Yetki istekleri ──────────────────────────────────────────────────────────
+permission_requests = {}
 
-# ─── SOS uyarıları ───
-sos_alerts = {}               # roomName → {userId, lat, lng, message, timestamp}
+# ─── SOS uyarıları ────────────────────────────────────────────────────────────
+sos_alerts = {}
 
-# ─── Müzik yayını ───
-music_broadcasts = {}         # roomName → {broadcasterId, title, startedAt, chunks: []}
+# ─── Müzik yayını ─────────────────────────────────────────────────────────────
+music_broadcasts = {}
 
-# ─── Geofence bölgeleri ───
-room_geofences = {}           # roomName → [{id, name, center_lat, center_lng, radius, createdBy, createdAt}]
-user_geofences: dict = {}  # userId → [{id, name, center_lat, ...}]
-geofence_entries = {}         # "userId_geofenceId" → {userId, geofenceId, entryTime, roomName}
+# ─── Geofence bölgeleri ───────────────────────────────────────────────────────
+room_geofences = {}
+user_geofences: dict = {}
+geofence_entries = {}
 
-# ─── Süper admin ───
-# ── Süper admin kimlik bilgileri ──────────────────────────────────────────────
-# Cihaz ID (sabit, değişmez) veya ID+şifre çifti ile giriş
-SUPER_ADMIN_DEVICE_IDS: set = {
-    # "buraya_cihaz_id_ekle",
-}
+# ─── Kullanıcı yönetimi ───────────────────────────────────────────────────────
+kicked_users  = {}
+banned_users  = {}
+banned_devices = {}
+muted_users   = {}
 
-# ID + şifre çiftleri — uygulamada kendi ikonuna uzun basarak giriş
+# ─── Paylaşılan rotalar ───────────────────────────────────────────────────────
+shared_routes = {}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 🔐 SÜPER ADMİN
+# ═══════════════════════════════════════════════════════════════════════════════
+
+SUPER_ADMIN_DEVICE_IDS: set = {}
+
 SUPER_ADMIN_CREDENTIALS: dict = {
-    "admin": "1234",       # "id": "şifre"  ← istediğin gibi değiştir
+    "admin": "1234",
 }
 
-# Oturum tokenleri (RAM) — giriş sonrası üretilir
-_super_admin_sessions: dict = {}   # token → {userId, expiresAt}
+_super_admin_sessions: dict = {}
 
 def is_super_admin(user_id: str, device_id: str = "", token: str = "") -> bool:
-    """Cihaz ID, token veya aktif konum üzerinden süper admin kontrolü."""
-    # 1. Token kontrolü
     if token and token in _super_admin_sessions:
         sess = _super_admin_sessions[token]
         if datetime.now(DEFAULT_TIMEZONE) < sess["expiresAt"]:
             return True
         else:
             _super_admin_sessions.pop(token, None)
-    # 2. Cihaz ID doğrudan
     if device_id and device_id in SUPER_ADMIN_DEVICE_IDS:
         return True
-    # 3. Aktif konumdan cihaz ID
     loc = locations.get(user_id, {})
     if loc.get("deviceId", "") in SUPER_ADMIN_DEVICE_IDS:
         return True
     return False
 
-# ─── Çevrimdışı kullanıcılar (son görülme) ───
-# locations zaten tutuyor, offline = is_user_online() == False
-
 # ═══════════════════════════════════════════════════════════════════════════════
 # ⚙️ AYARLAR
 # ═══════════════════════════════════════════════════════════════════════════════
 
-DEFAULT_TIMEZONE = pytz.timezone('Europe/Istanbul')
-USER_TIMEOUT = 120
-IDLE_THRESHOLD = 15
-IDLE_TIME_MINUTES = 15
-SPEED_VEHICLE = 30
-SPEED_RUN = 15
-SPEED_WALK = 3
-MIN_DIST_VEHICLE = 50
-MIN_DIST_RUN = 20
-MIN_DIST_WALK = 10
-MIN_DIST_IDLE = 5
+DEFAULT_TIMEZONE   = pytz.timezone('Europe/Istanbul')
+USER_TIMEOUT       = 120
+IDLE_THRESHOLD     = 15
+IDLE_TIME_MINUTES  = 15
+SPEED_VEHICLE      = 30
+SPEED_RUN          = 15
+SPEED_WALK         = 3
+MIN_DIST_VEHICLE   = 50
+MIN_DIST_RUN       = 20
+MIN_DIST_WALK      = 10
+MIN_DIST_IDLE      = 5
 MAX_POINTS_PER_USER = 5000
-MAX_HISTORY_DAYS = 90
-PIN_COLLECT_START = 20
-PIN_COLLECT_END = 25
-MAX_ROOM_MESSAGES = 200
-MAX_WALKIE_QUEUE = 20         # Oda başına max ses kuyruk
-MAX_VOICE_MESSAGES = 500      # Toplam sesli mesaj limiti
+MAX_HISTORY_DAYS   = 90
+PIN_COLLECT_START  = 20
+PIN_COLLECT_END    = 25
+MAX_ROOM_MESSAGES  = 200
+MAX_WALKIE_QUEUE   = 20
+MAX_VOICE_MESSAGES = 500
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # 🛠️ YARDIMCI FONKSİYONLAR
@@ -284,13 +331,35 @@ class MusicStopModel(BaseModel):
 class PermissionRequestModel(BaseModel):
     roomName: str
     requesterUserId: str
-    permissionType: str   # "pin" veya "voice"
+    permissionType: str
     message: str = ""
 
 class PermissionRespondModel(BaseModel):
     requestId: str
     adminUserId: str
     approved: bool
+
+class GeofenceSaveModel(BaseModel):
+    roomName: str
+    adminId: str
+    geofences: list
+
+class GeofenceEntryModel(BaseModel):
+    roomName: str
+    userId: str
+    geofenceId: str
+    inside: bool
+
+class GeofenceRenameModel(BaseModel):
+    roomName: str
+    adminId: str
+    geofenceId: str
+    newName: str
+
+class ShareRouteModel(BaseModel):
+    roomName: str
+    sharedBy: str
+    waypoints: list
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # 🏠 ANA SAYFA
@@ -300,12 +369,16 @@ class PermissionRespondModel(BaseModel):
 def root():
     online_count = sum(1 for u in locations.values()
                       if is_user_online(u.get("lastSeen", "")))
+    total_pts = sum(len(v) for v in location_history.values())
     return {
         "status": "✅ Server çalışıyor",
         "time": get_local_time(),
         "online_users": online_count,
         "total_rooms": len(rooms),
         "total_pins": len(pins),
+        "history_users": len(location_history),
+        "history_points": total_pts,
+        "data_dir": _DATA_DIR,
     }
 
 @app.get("/health")
@@ -338,11 +411,10 @@ def join_room(data: JoinRoomModel):
         return {"message": "Genel odaya katıldınız"}
     if data.roomName not in rooms:
         raise HTTPException(status_code=404, detail="Oda bulunamadı!")
-    # Süper admin şifresiz girebilir
     if is_super_admin(data.adminId, data.deviceId, data.token):
         return {"message": f"✅ {data.roomName} odasına katıldınız (admin)"}
     if rooms[data.roomName]["password"] != data.password:
-        raise HTTPException(status_code=401, detail="Yanlış şifre!")
+        raise HTTPException(status_code=401, detail="Yanlış Şifre!")
     return {"message": f"✅ {data.roomName} odasına katıldınız"}
 
 @app.get("/get_rooms")
@@ -413,7 +485,7 @@ def change_room_password(room_name: str, admin_id: str, new_password: str):
     return {"message": "✅ Şifre değiştirildi"}
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 🔑 YETKİ SİSTEMİ (GENİŞLETİLMİŞ)
+# 🔑 YETKİ SİSTEMİ
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @app.get("/get_room_permissions/{room_name}")
@@ -423,10 +495,10 @@ def get_room_permissions(room_name: str):
     if room_name not in rooms:
         return {"admin": None, "collectors": [], "voiceAllowed": []}
     return {
-        "admin":      rooms[room_name]["createdBy"],
-        "collectors": rooms[room_name].get("collectors", []),
+        "admin":        rooms[room_name]["createdBy"],
+        "collectors":   rooms[room_name].get("collectors", []),
         "voiceAllowed": rooms[room_name].get("voiceAllowed", []),
-        "mutedUsers": list(muted_users.keys()),
+        "mutedUsers":   list(muted_users.keys()),
     }
 
 @app.post("/set_collector_permission/{room_name}/{target_user}")
@@ -457,11 +529,8 @@ def set_voice_permission(room_name: str, target_user: str, admin_id: str, enable
     rooms[room_name]["voiceAllowed"] = voice_allowed
     return {"message": "✅ Ses yetkisi güncellendi", "voiceAllowed": voice_allowed}
 
-# ─── Yetki istek sistemi ───
-
 @app.post("/request_permission")
 def request_permission(data: PermissionRequestModel):
-    # Oda admin kontrolü
     if data.roomName not in rooms:
         raise HTTPException(status_code=404, detail="Oda bulunamadı!")
     req_id = str(uuid.uuid4())[:8]
@@ -504,7 +573,6 @@ def respond_permission(data: PermissionRespondModel):
 
 @app.get("/get_pending_requests/{user_id}")
 def get_pending_requests(user_id: str):
-    """Admin: bekleyen (pending) istekleri döndür. Kullanıcı: kendi isteklerini döndür."""
     result = []
     for req in permission_requests.values():
         room_name = req["roomName"]
@@ -518,7 +586,6 @@ def get_pending_requests(user_id: str):
 
 @app.get("/get_request_result/{request_id}/{user_id}")
 def get_request_result(request_id: str, user_id: str):
-    """Kullanıcı kendi isteğinin sonucunu öğrenir."""
     if request_id not in permission_requests:
         raise HTTPException(status_code=404, detail="İstek bulunamadı!")
     req = permission_requests[request_id]
@@ -532,7 +599,7 @@ def get_request_result(request_id: str, user_id: str):
     }
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 👁️ GÖRÜNÜRLİK
+# 👁️ GÖRÜNÜRLÜK
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @app.post("/set_visibility")
@@ -546,12 +613,11 @@ def set_visibility(data: VisibilityModel):
 
 @app.post("/update_location")
 def update_location(data: LocationModel):
+    global _save_pending
     uid = data.userId
     now = get_local_time()
 
-    # Banlı kullanıcı sadece Genel odada kalabilir
     if uid in banned_users or (data.deviceId and data.deviceId in banned_devices):
-        # Konumu güncelle ama odayı Genel'e kilitle
         data.roomName = "Genel"
 
     idle_status = "online"
@@ -606,6 +672,7 @@ def update_location(data: LocationModel):
             "timestamp": now, "speed": data.speed,
         })
         cleanup_old_routes()
+        _save_pending = True   # ← diske yaz işaretlendi
 
     if uid in locations:
         room = data.roomName
@@ -657,7 +724,6 @@ def update_location(data: LocationModel):
 @app.get("/get_locations/{room_name}")
 def get_locations(room_name: str, viewer_id: str = "", viewer_device_id: str = ""):
     result = []
-    # Banlı viewer sadece diğer banlı kullanıcıları görebilir
     viewer_is_banned = viewer_id in banned_users or (
         viewer_device_id and viewer_device_id in banned_devices
     )
@@ -668,7 +734,6 @@ def get_locations(room_name: str, viewer_id: str = "", viewer_device_id: str = "
             continue
         if data.get("roomName") != room_name:
             continue
-        # Banlı viewer sadece banlıları görür; banlı kullanıcılar normal kullanıcılara görünmez
         uid_is_banned = uid in banned_users
         if viewer_is_banned and not uid_is_banned:
             continue
@@ -681,18 +746,14 @@ def get_locations(room_name: str, viewer_id: str = "", viewer_device_id: str = "
             viewer_room = locations.get(viewer_id, {}).get("roomName", "Genel")
             if viewer_room != data.get("roomName"):
                 continue
-        # Bu kullanıcı odanın admini mi?
         user_room = data.get("roomName", "Genel")
         room_data = rooms.get(user_room, {})
-        # Genel oda sistem odasıdır — admin yok
-        # Diğer odalar: creator veya aktif süper admin oturumu
-        is_creator    = bool(room_data.get("createdBy")) and room_data.get("createdBy") == uid
-        is_super_now  = any(
+        is_creator   = bool(room_data.get("createdBy")) and room_data.get("createdBy") == uid
+        is_super_now = any(
             s["userId"] == uid and datetime.now(DEFAULT_TIMEZONE) < s["expiresAt"]
             for s in _super_admin_sessions.values()
         )
         is_room_admin = is_creator or is_super_now
-
         result.append({
             "userId": uid, "deviceId": data.get("deviceId", ""),
             "lat": data["lat"], "lng": data["lng"],
@@ -705,7 +766,7 @@ def get_locations(room_name: str, viewer_id: str = "", viewer_device_id: str = "
             "character": data.get("character", "🧍"),
             "isHidden": False,
             "isRoomAdmin": is_room_admin,
-            "isSuperAdmin": is_super_now,  # Sadece aktif süper admin oturumu varsa true
+            "isSuperAdmin": is_super_now,
         })
     return result
 
@@ -724,32 +785,43 @@ def get_offline_users(admin_id: str = "", device_id: str = "", token: str = ""):
     return result
 
 @app.get("/get_location_history/{user_id}")
-def get_location_history(user_id: str, period: str = "all", requester_id: str = ""):
-    # Yetki kontrolü: sadece kendisi veya aynı odanın admini görebilir
+def get_location_history(user_id: str, period: str = "all",
+                          requester_id: str = "", device_id: str = ""):
+    # Yetki kontrolü
     if requester_id and requester_id != user_id:
-        # Requester'ın admin olduğu odaları bul
         admin_rooms = {name for name, room in rooms.items() if room.get("createdBy") == requester_id}
-        # Hedef kullanıcının odasını bul
         target_room = locations.get(user_id, {}).get("roomName", "")
-        if target_room not in admin_rooms and not is_super_admin(requester_id):
+        if target_room not in admin_rooms and not is_super_admin(requester_id, device_id):
             raise HTTPException(status_code=403, detail="Bu kullanıcının geçmişini görme yetkiniz yok")
+
     history = location_history.get(user_id, [])
     if period == "all":
         return history
+
     now = datetime.now(DEFAULT_TIMEZONE)
-    cutoffs = {"day": timedelta(days=1), "week": timedelta(weeks=1),
-               "month": timedelta(days=30), "year": timedelta(days=365)}
+    cutoffs = {
+        "day":   timedelta(days=1),
+        "week":  timedelta(weeks=1),
+        "month": timedelta(days=30),
+        "year":  timedelta(days=365),
+    }
     cutoff = now - cutoffs.get(period, timedelta(days=1))
-    return [p for p in history if datetime.strptime(p["timestamp"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=DEFAULT_TIMEZONE) > cutoff]
+    return [
+        p for p in history
+        if datetime.strptime(p["timestamp"], "%Y-%m-%d %H:%M:%S")
+           .replace(tzinfo=DEFAULT_TIMEZONE) > cutoff
+    ]
 
 @app.delete("/clear_history/{user_id}")
 def clear_history(user_id: str):
+    global _save_pending
     if user_id in location_history:
         location_history[user_id] = []
+    _save_pending = True
     return {"message": "✅ Geçmiş temizlendi"}
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 📍 PIN SİSTEMİ
+# 📌 PIN SİSTEMİ
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @app.post("/create_pin")
@@ -873,7 +945,7 @@ def get_room_unread(room_name: str, user_id: str):
     return {"count": len(msgs), "lastId": msgs[-1]["id"] if msgs else ""}
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 🔊 SESLİ MESAJLAR (1-1)
+# 🎙️ SESLİ MESAJLAR (1-1)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @app.post("/send_voice_message")
@@ -881,14 +953,11 @@ def send_voice_message(data: VoiceMessageModel):
     voice_id = str(uuid.uuid4())[:12]
     voice_messages[voice_id] = {
         "voiceId": voice_id,
-        "fromUser": data.fromUser,
-        "toUser": data.toUser,
+        "fromUser": data.fromUser, "toUser": data.toUser,
         "audioBase64": data.audioBase64,
         "durationSeconds": data.durationSeconds,
-        "timestamp": get_local_time(),
-        "read": False,
+        "timestamp": get_local_time(), "read": False,
     }
-    # Konuşmaya da ekle
     key = get_conv_key(data.fromUser, data.toUser)
     if key not in messages:
         messages[key] = []
@@ -900,7 +969,6 @@ def send_voice_message(data: VoiceMessageModel):
         "durationSeconds": data.durationSeconds,
         "timestamp": get_local_time(), "read": False,
     })
-    # Limit
     if len(voice_messages) > MAX_VOICE_MESSAGES:
         oldest_key = next(iter(voice_messages))
         del voice_messages[oldest_key]
@@ -913,7 +981,7 @@ def get_voice_message(voice_id: str):
     return voice_messages[voice_id]
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 🔊 SESLİ MESAJLAR (GRUP)
+# 🎙️ SESLİ MESAJLAR (GRUP)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @app.post("/send_room_voice_message")
@@ -923,14 +991,11 @@ def send_room_voice_message(data: RoomVoiceMessageModel):
         raise HTTPException(status_code=404, detail="Oda bulunamadı!")
     voice_id = str(uuid.uuid4())[:12]
     room_voice_messages[voice_id] = {
-        "voiceId": voice_id,
-        "fromUser": data.fromUser,
-        "roomName": room,
+        "voiceId": voice_id, "fromUser": data.fromUser, "roomName": room,
         "audioBase64": data.audioBase64,
         "durationSeconds": data.durationSeconds,
         "timestamp": get_local_time(),
     }
-    # Grup mesajına da ekle
     if room not in room_messages:
         room_messages[room] = []
     room_messages[room].append({
@@ -961,8 +1026,7 @@ def walkie_send(data: WalkieSendModel):
     key = get_conv_key(data.fromUser, data.toUser)
     walkie_queue[key] = {
         "id": str(uuid.uuid4())[:8],
-        "from": data.fromUser,
-        "to": data.toUser,
+        "from": data.fromUser, "to": data.toUser,
         "audioBase64": data.audioBase64,
         "timestamp": get_local_time(),
     }
@@ -973,12 +1037,8 @@ def walkie_listen(user_id: str, other_user: str, last_id: str = ""):
     key = get_conv_key(user_id, other_user)
     entry = walkie_queue.get(key)
     if entry and entry.get("to") == user_id and entry.get("id") != last_id:
-        return {
-            "hasAudio": True,
-            "id": entry["id"],
-            "from": entry["from"],
-            "audioBase64": entry["audioBase64"],
-        }
+        return {"hasAudio": True, "id": entry["id"],
+                "from": entry["from"], "audioBase64": entry["audioBase64"]}
     return {"hasAudio": False, "id": last_id}
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -992,13 +1052,11 @@ def room_walkie_send(data: RoomWalkieSendModel):
         room_walkie_queue[room] = []
     entry = {
         "id": str(uuid.uuid4())[:8],
-        "from": data.fromUser,
-        "roomName": room,
+        "from": data.fromUser, "roomName": room,
         "audioBase64": data.audioBase64,
         "timestamp": get_local_time(),
     }
     room_walkie_queue[room].append(entry)
-    # Kuyruk limitini koru
     if len(room_walkie_queue[room]) > MAX_WALKIE_QUEUE:
         room_walkie_queue[room] = room_walkie_queue[room][-MAX_WALKIE_QUEUE:]
     return {"message": "✅ Oda walkie gönderildi", "id": entry["id"]}
@@ -1006,31 +1064,20 @@ def room_walkie_send(data: RoomWalkieSendModel):
 @app.get("/room_walkie_listen/{room_name}")
 def room_walkie_listen(room_name: str, user_id: str = "", last_id: str = ""):
     queue = room_walkie_queue.get(room_name, [])
-    # last_id'den sonraki ilk mesajı bul (kendi gönderdikleri hariç)
     if not last_id:
-        # İlk poll: en son mesajı ver (kendi değilse)
         for entry in reversed(queue):
             if entry["from"] != user_id:
-                return {
-                    "hasAudio": True,
-                    "id": entry["id"],
-                    "from": entry["from"],
-                    "audioBase64": entry["audioBase64"],
-                }
+                return {"hasAudio": True, "id": entry["id"],
+                        "from": entry["from"], "audioBase64": entry["audioBase64"]}
         return {"hasAudio": False, "id": ""}
-    # last_id'den sonraki mesajları bul
     found_last = False
     for entry in queue:
         if entry["id"] == last_id:
             found_last = True
             continue
         if found_last and entry["from"] != user_id:
-            return {
-                "hasAudio": True,
-                "id": entry["id"],
-                "from": entry["from"],
-                "audioBase64": entry["audioBase64"],
-            }
+            return {"hasAudio": True, "id": entry["id"],
+                    "from": entry["from"], "audioBase64": entry["audioBase64"]}
     return {"hasAudio": False, "id": last_id}
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1040,12 +1087,9 @@ def room_walkie_listen(room_name: str, user_id: str = "", last_id: str = ""):
 @app.post("/sos_alert")
 def sos_alert(data: SosModel):
     sos_alerts[data.roomName] = {
-        "userId": data.userId,
-        "roomName": data.roomName,
+        "userId": data.userId, "roomName": data.roomName,
         "lat": data.lat, "lng": data.lng,
-        "message": data.message,
-        "timestamp": get_local_time(),
-        "active": True,
+        "message": data.message, "timestamp": get_local_time(), "active": True,
     }
     return {"message": "✅ SOS gönderildi"}
 
@@ -1066,11 +1110,8 @@ def cancel_sos(room_name: str, user_id: str):
 @app.post("/music_start")
 def music_start(data: MusicStartModel):
     music_broadcasts[data.roomName] = {
-        "broadcasterId": data.broadcasterId,
-        "title": data.title,
-        "startedAt": get_local_time(),
-        "chunks": [],
-        "chunkIndex": 0,
+        "broadcasterId": data.broadcasterId, "title": data.title,
+        "startedAt": get_local_time(), "chunks": [], "chunkIndex": 0,
     }
     return {"message": "✅ Yayın başladı"}
 
@@ -1081,13 +1122,10 @@ def music_chunk(data: MusicChunkModel):
     broadcast = music_broadcasts[data.roomName]
     chunk_id = str(uuid.uuid4())[:8]
     broadcast["chunks"].append({
-        "id": chunk_id,
-        "index": broadcast["chunkIndex"],
-        "audioBase64": data.audioBase64,
-        "timestamp": get_local_time(),
+        "id": chunk_id, "index": broadcast["chunkIndex"],
+        "audioBase64": data.audioBase64, "timestamp": get_local_time(),
     })
     broadcast["chunkIndex"] += 1
-    # Son 10 chunk'ı tut
     if len(broadcast["chunks"]) > 10:
         broadcast["chunks"] = broadcast["chunks"][-10:]
     return {"message": "✅ Chunk kaydedildi", "chunkId": chunk_id}
@@ -1103,12 +1141,8 @@ def music_status(room_name: str):
     broadcast = music_broadcasts.get(room_name)
     if not broadcast:
         return {"active": False, "broadcasterId": None, "title": ""}
-    return {
-        "active": True,
-        "broadcasterId": broadcast["broadcasterId"],
-        "title": broadcast["title"],
-        "chunkCount": len(broadcast["chunks"]),
-    }
+    return {"active": True, "broadcasterId": broadcast["broadcasterId"],
+            "title": broadcast["title"], "chunkCount": len(broadcast["chunks"])}
 
 @app.get("/music_listen/{room_name}")
 def music_listen(room_name: str, after_index: int = 0):
@@ -1116,12 +1150,9 @@ def music_listen(room_name: str, after_index: int = 0):
     if not broadcast:
         return {"active": False, "chunks": []}
     chunks = [c for c in broadcast["chunks"] if c["index"] > after_index]
-    return {
-        "active": True,
-        "broadcasterId": broadcast["broadcasterId"],
-        "title": broadcast["title"],
-        "chunks": [{"id": c["id"], "index": c["index"]} for c in chunks],
-    }
+    return {"active": True, "broadcasterId": broadcast["broadcasterId"],
+            "title": broadcast["title"],
+            "chunks": [{"id": c["id"], "index": c["index"]} for c in chunks]}
 
 @app.get("/music_chunk_data/{room_name}/{chunk_id}")
 def music_chunk_data(room_name: str, chunk_id: str):
@@ -1143,48 +1174,33 @@ def check_super_admin(user_id: str, device_id: str = "", token: str = ""):
 
 @app.post("/super_admin_login")
 def super_admin_login(data: dict):
-    """ID + şifre ile süper admin girişi — token döner."""
-    admin_id = data.get("adminId", "").strip()
+    admin_id  = data.get("adminId", "").strip()
     password  = data.get("password", "").strip()
-    requester = data.get("userId", "").strip()
-
     if not admin_id or not password:
-        raise HTTPException(400, "ID ve şifre gerekli")
+        raise HTTPException(400, "ID ve Şifre gerekli")
     if SUPER_ADMIN_CREDENTIALS.get(admin_id) != password:
-        raise HTTPException(403, "Hatalı ID veya şifre")
-
-    # Aynı admin ID ile mevcut oturum varsa iptal et (yeniden giriş izni)
+        raise HTTPException(403, "Hatalı ID veya Şifre")
     now = datetime.now(DEFAULT_TIMEZONE)
     requester_device = data.get("deviceId", "").strip()
-    stale_tokens = [
-        t for t, s in _super_admin_sessions.items()
-        if s["userId"] == admin_id and now < s["expiresAt"]
-    ]
-    if stale_tokens:
-        # Aynı cihaz: sessizce eski oturumu kapat ve yenile
-        # Farklı cihaz: yine de izin ver (admin kendi oturumunu devralır)
-        for t in stale_tokens:
-            del _super_admin_sessions[t]
-
-    # 24 saatlik token üret
+    stale_tokens = [t for t, s in _super_admin_sessions.items()
+                    if s["userId"] == admin_id and now < s["expiresAt"]]
+    for t in stale_tokens:
+        del _super_admin_sessions[t]
     token = str(uuid.uuid4())
     _super_admin_sessions[token] = {
-        "userId":    admin_id,
+        "userId": admin_id,
         "expiresAt": datetime.now(DEFAULT_TIMEZONE) + timedelta(hours=24),
-        "deviceId":  requester_device,
+        "deviceId": requester_device,
     }
     return {"token": token, "message": "✅ Süper admin girişi başarılı"}
 
 @app.post("/super_admin_logout")
 def super_admin_logout(data: dict):
-    """Süper admin oturumunu sonlandır"""
     admin_id = data.get("adminId", "")
     token    = data.get("token", "")
-    # Token varsa sil
     if token and token in _super_admin_sessions:
         del _super_admin_sessions[token]
         return {"message": "✅ Admin oturumu kapatıldı"}
-    # Token yoksa adminId'ye göre temizle
     to_delete = [t for t, s in _super_admin_sessions.items() if s["userId"] == admin_id]
     for t in to_delete:
         del _super_admin_sessions[t]
@@ -1200,28 +1216,18 @@ def get_all_rooms_info(admin_id: str = "", device_id: str = "", token: str = "")
         room_admin = room_data.get("createdBy")
         online = [u for u in locations.values()
                   if u.get("roomName") == room_name and is_user_online(u.get("lastSeen", ""))]
-        # Her kullanıcının oda admini olup olmadığını işaretle
         user_list = []
         for u in online:
             uid = u["userId"]
-            # Bu kullanıcı başka bir odanın admini mi?
-            is_room_creator = any(
-                r.get("createdBy") == uid
-                for r in rooms.values()
-            )
+            is_room_creator = any(r.get("createdBy") == uid for r in rooms.values())
             user_list.append({
-                "userId":    uid,
-                "character": u.get("character", "🧍"),
-                "isAdmin":   uid == room_admin,
-                "isCreator": is_room_creator,
-                "isHidden":  False,
+                "userId": uid, "character": u.get("character", "🧍"),
+                "isAdmin": uid == room_admin, "isCreator": is_room_creator, "isHidden": False,
             })
         result.append({
-            "roomName":    room_name,
-            "onlineCount": len(online),
-            "roomAdmin":   room_admin,
-            "hasPassword": bool(room_data.get("password")),
-            "users":       user_list,
+            "roomName": room_name, "onlineCount": len(online),
+            "roomAdmin": room_admin, "hasPassword": bool(room_data.get("password")),
+            "users": user_list,
         })
     return result
 
@@ -1235,7 +1241,7 @@ def register_fcm_token(data: FcmTokenModel):
     return {"message": "✅ FCM token kaydedildi"}
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 👤 KULLANICI ADI DEĞİŞTİRME
+# 🤝 KULLANICI ADI DEĞİŞTİRME
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @app.post("/change_username")
@@ -1245,15 +1251,12 @@ def change_username(data: ChangeUsernameModel):
     if not new or len(new.strip()) < 1:
         raise HTTPException(status_code=400, detail="İsim boş olamaz!")
     if new in locations and new != old:
-        existing = locations[new]
-        req_device   = (data.deviceId or "").strip() if hasattr(data, "deviceId") else ""
+        existing    = locations[new]
+        req_device  = (data.deviceId or "").strip()
         exist_device = existing.get("deviceId", "").strip()
-
-        same_device  = req_device and exist_device and req_device == exist_device
-        timed_out    = not is_user_online(existing.get("lastSeen", ""))
-
+        same_device = req_device and exist_device and req_device == exist_device
+        timed_out   = not is_user_online(existing.get("lastSeen", ""))
         if same_device or timed_out:
-            # Aynı cihaz ya da eski oturum süresi dolmuş — eski kaydı temizle
             locations.pop(new, None)
         else:
             raise HTTPException(status_code=400, detail="Bu isim zaten kullanımda!")
@@ -1262,6 +1265,8 @@ def change_username(data: ChangeUsernameModel):
         locations[new]["userId"] = new
     if old in location_history:
         location_history[new] = location_history.pop(old)
+        global _save_pending
+        _save_pending = True
     for key in list(scores.keys()):
         if key.endswith(f"_{old}"):
             room = key[:-(len(old)+1)]
@@ -1276,7 +1281,7 @@ def change_username(data: ChangeUsernameModel):
             conv = messages.pop(key)
             for msg in conv:
                 if msg['from'] == old: msg['from'] = new
-                if msg['to'] == old: msg['to'] = new
+                if msg['to']   == old: msg['to']   = new
             other = parts[1] if parts[0] == old else parts[0]
             new_key = '_'.join(sorted([new, other]))
             if new_key in messages:
@@ -1287,203 +1292,129 @@ def change_username(data: ChangeUsernameModel):
     for room_msgs in room_messages.values():
         for msg in room_msgs:
             if msg.get('from') == old: msg['from'] = new
-
-    # ── Oda admin yetkisi ──────────────────────────────────────────────────────
     for room in rooms.values():
         if room.get("createdBy") == old:
             room["createdBy"] = new
-        # Pin toplama yetkisi
         collectors = room.get("collectors", [])
         if old in collectors:
-            collectors.remove(old)
-            collectors.append(new)
-        # Ses yetkisi
+            collectors.remove(old); collectors.append(new)
         voice = room.get("voiceAllowed", [])
         if old in voice:
-            voice.remove(old)
-            voice.append(new)
-
-    # ── Geofence giriş kayıtları ───────────────────────────────────────────────
+            voice.remove(old); voice.append(new)
     for key in list(geofence_entries.keys()):
         entry = geofence_entries[key]
         if entry.get("userId") == old:
             geofence_entries.pop(key)
             entry["userId"] = new
-            new_key = f"{new}_{entry['geofenceId']}"
-            geofence_entries[new_key] = entry
-
-    # ── Geofence bölge oluşturanı güncelle ────────────────────────────────────
+            geofence_entries[f"{new}_{entry['geofenceId']}"] = entry
     for gf_list in room_geofences.values():
         for gf in gf_list:
-            if gf.get("createdBy") == old:
-                gf["createdBy"] = new
-
-    # ── FCM token ─────────────────────────────────────────────────────────────
+            if gf.get("createdBy") == old: gf["createdBy"] = new
     if old in fcm_tokens:
         fcm_tokens[new] = fcm_tokens.pop(old)
-
-    # ── Atılma kaydı ──────────────────────────────────────────────────────────
     if old in kicked_users:
         kicked_users[new] = kicked_users.pop(old)
-    # ── Susturma kaydı ────────────────────────────────────────────────────────
     if old in muted_users:
         muted_users[new] = muted_users.pop(old)
-
-    # ── Pinler (creator) ──────────────────────────────────────────────────────
     for pin in pins.values():
-        if pin.get("creator") == old:
-            pin["creator"] = new
-
-    # ── Walkie kuyrukları ─────────────────────────────────────────────────────
+        if pin.get("creator") == old: pin["creator"] = new
     for key in list(walkie_queue.keys()):
         entry = walkie_queue[key]
-        if entry.get("from") == old:
-            entry["from"] = new
+        if entry.get("from") == old: entry["from"] = new
         parts = key.split("_", 1)
         if len(parts) == 2:
             frm, to = parts
             if frm == old or to == old:
                 walkie_queue.pop(key)
-                new_key = f"{new if frm == old else frm}_{new if to == old else to}"
+                new_key = f"{new if frm==old else frm}_{new if to==old else to}"
                 walkie_queue[new_key] = entry
     for room_queue in room_walkie_queue.values():
         for entry in room_queue:
-            if entry.get("from") == old:
-                entry["from"] = new
-
-    # ── Sesli mesajlar ────────────────────────────────────────────────────────
+            if entry.get("from") == old: entry["from"] = new
     for vm in voice_messages.values():
         if vm.get("fromUser") == old: vm["fromUser"] = new
         if vm.get("toUser")   == old: vm["toUser"]   = new
     for rvm in room_voice_messages.values():
         if rvm.get("fromUser") == old: rvm["fromUser"] = new
-
-    # ── Yetki istekleri ───────────────────────────────────────────────────────
     for req in permission_requests.values():
-        if req.get("requesterUserId") == old:
-            req["requesterUserId"] = new
-
-    # ── SOS uyarıları ─────────────────────────────────────────────────────────
+        if req.get("requesterUserId") == old: req["requesterUserId"] = new
     for alert in sos_alerts.values():
-        if alert.get("userId") == old:
-            alert["userId"] = new
-
-    # ── Müzik yayınları ───────────────────────────────────────────────────────
+        if alert.get("userId") == old: alert["userId"] = new
     for broadcast in music_broadcasts.values():
-        if broadcast.get("broadcasterId") == old:
-            broadcast["broadcasterId"] = new
-
-    # ── Görünürlük ayarları ───────────────────────────────────────────────────
+        if broadcast.get("broadcasterId") == old: broadcast["broadcasterId"] = new
     if old in visibility_settings:
         visibility_settings[new] = visibility_settings.pop(old)
-    # İzin listelerinde de güncelle
     for vs in visibility_settings.values():
         allowed = vs.get("allowed", [])
         if old in allowed:
-            allowed.remove(old)
-            allowed.append(new)
-
+            allowed.remove(old); allowed.append(new)
     return {"message": f"✅ İsim değiştirildi: {old} → {new}"}
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 🔵 GEOFENCE
+# 🗺️ GEOFENCE
 # ═══════════════════════════════════════════════════════════════════════════════
-
-class GeofenceSaveModel(BaseModel):
-    roomName: str
-    adminId: str
-    geofences: list  # [{id, name, center_lat, center_lng, radius}]
-
-class GeofenceEntryModel(BaseModel):
-    roomName: str
-    userId: str
-    geofenceId: str
-    inside: bool
-
-class GeofenceRenameModel(BaseModel):
-    roomName: str
-    adminId: str
-    geofenceId: str
-    newName: str
 
 @app.post("/geofence/save")
 def geofence_save(data: GeofenceSaveModel):
     room = rooms.get(data.roomName)
     if not room:
         raise HTTPException(status_code=404, detail="Oda bulunamadı")
-    is_sadmin = is_super_admin(data.adminId, "", "")
-    if room.get("createdBy") != data.adminId and not is_sadmin:
+    if room.get("createdBy") != data.adminId and not is_super_admin(data.adminId):
         raise HTTPException(status_code=403, detail="Sadece oda admini veya süper admin kaydedebilir")
-    now = datetime.now(DEFAULT_TIMEZONE).strftime("%Y-%m-%d %H:%M:%S")
-    saved = []
-    for gf in data.geofences:
-        saved.append({
-            "id":          gf["id"],
-            "name":        gf["name"],
-            "center_lat":  gf["center_lat"],
-            "center_lng":  gf["center_lng"],
-            "radius":      gf["radius"],
-            "createdBy":   data.adminId,
-            "createdAt":   gf.get("createdAt", now),
-        })
+    now = get_local_time()
+    saved = [{
+        "id": gf["id"], "name": gf["name"],
+        "center_lat": gf["center_lat"], "center_lng": gf["center_lng"],
+        "radius": gf["radius"], "createdBy": data.adminId,
+        "createdAt": gf.get("createdAt", now),
+    } for gf in data.geofences]
     room_geofences[data.roomName] = saved
     return {"message": f"✅ {len(saved)} geofence kaydedildi"}
 
 @app.get("/geofence/get/{room_name}")
 def geofence_get(room_name: str):
     gfs = room_geofences.get(room_name, [])
-    # Entry bilgilerini de ekle
     result = []
     for gf in gfs:
-        entries = [
-            v for k, v in geofence_entries.items()
-            if k.endswith(f"_{gf['id']}") and v.get("roomName") == room_name
-        ]
+        entries = [v for k, v in geofence_entries.items()
+                   if k.endswith(f"_{gf['id']}") and v.get("roomName") == room_name]
         result.append({**gf, "entries": entries})
     return {"geofences": result}
 
 @app.post("/geofence/entry")
 def geofence_entry(data: GeofenceEntryModel):
     key = f"{data.userId}_{data.geofenceId}"
-    now = datetime.now(DEFAULT_TIMEZONE).strftime("%Y-%m-%d %H:%M:%S")
+    now = get_local_time()
     if data.inside:
         geofence_entries[key] = {
-            "userId":      data.userId,
-            "geofenceId":  data.geofenceId,
-            "entryTime":   now,
-            "roomName":    data.roomName,
+            "userId": data.userId, "geofenceId": data.geofenceId,
+            "entryTime": now, "roomName": data.roomName,
         }
     else:
         geofence_entries.pop(key, None)
     return {"ok": True}
 
-# ─── Kişisel Geofence (kullanıcı bazlı, gizli) ───────────────────────────────
-
 @app.post("/geofence/personal/save")
 def personal_geofence_save(data: dict):
-    """Kullanıcı kendi kişisel geofence'lerini kaydeder — sadece kendisi görür"""
-    user_id    = data.get("userId", "").strip()
-    geofences  = data.get("geofences", [])
+    user_id   = data.get("userId", "").strip()
+    geofences = data.get("geofences", [])
     if not user_id:
         raise HTTPException(400, "userId gerekli")
-    now = datetime.now(DEFAULT_TIMEZONE).strftime("%Y-%m-%d %H:%M:%S")
-    saved = []
-    for gf in geofences:
-        saved.append({
-            "id":         gf.get("id", str(uuid.uuid4())[:8]),
-            "name":       gf.get("name", "Bölgem"),
-            "center_lat": float(gf.get("center_lat", 0)),
-            "center_lng": float(gf.get("center_lng", 0)),
-            "radius":     float(gf.get("radius", 100)),
-            "threshold":  int(gf.get("threshold", 0)),
-            "createdAt":  gf.get("createdAt", now),
-        })
+    now = get_local_time()
+    saved = [{
+        "id":         gf.get("id", str(uuid.uuid4())[:8]),
+        "name":       gf.get("name", "Bölgem"),
+        "center_lat": float(gf.get("center_lat", 0)),
+        "center_lng": float(gf.get("center_lng", 0)),
+        "radius":     float(gf.get("radius", 100)),
+        "threshold":  int(gf.get("threshold", 0)),
+        "createdAt":  gf.get("createdAt", now),
+    } for gf in geofences]
     user_geofences[user_id] = saved
     return {"message": f"✅ {len(saved)} kişisel geofence kaydedildi"}
 
 @app.get("/geofence/personal/get/{user_id}")
 def personal_geofence_get(user_id: str, requester: str = ""):
-    """Sadece sahibi veya süper admin görebilir"""
     if requester != user_id and not any(
         s["userId"] == requester and datetime.now(DEFAULT_TIMEZONE) < s["expiresAt"]
         for s in _super_admin_sessions.values()
@@ -1493,22 +1424,18 @@ def personal_geofence_get(user_id: str, requester: str = ""):
 
 @app.delete("/geofence/personal/delete/{user_id}/{geofence_id}")
 def personal_geofence_delete(user_id: str, geofence_id: str, requester: str = ""):
-    """Sadece sahibi silebilir"""
     if requester != user_id:
         raise HTTPException(403, "Sadece sahibi silebilir")
-    gfs = user_geofences.get(user_id, [])
-    user_geofences[user_id] = [g for g in gfs if g["id"] != geofence_id]
+    user_geofences[user_id] = [g for g in user_geofences.get(user_id, []) if g["id"] != geofence_id]
     return {"message": "✅ Silindi"}
 
 @app.post("/geofence/personal/rename")
 def personal_geofence_rename(data: dict):
-    user_id     = data.get("userId", "")
-    geofence_id = data.get("geofenceId", "")
-    new_name    = data.get("newName", "")
+    user_id = data.get("userId", ""); geofence_id = data.get("geofenceId", "")
+    new_name = data.get("newName", "")
     if not user_id or not geofence_id:
         raise HTTPException(400, "Eksik parametre")
-    gfs = user_geofences.get(user_id, [])
-    for gf in gfs:
+    for gf in user_geofences.get(user_id, []):
         if gf["id"] == geofence_id:
             gf["name"] = new_name
             return {"message": "✅ İsim güncellendi"}
@@ -1516,11 +1443,9 @@ def personal_geofence_rename(data: dict):
 
 @app.post("/geofence/personal/threshold")
 def personal_geofence_threshold(data: dict):
-    user_id     = data.get("userId", "")
-    geofence_id = data.get("geofenceId", "")
-    threshold   = int(data.get("threshold", 0))
-    gfs = user_geofences.get(user_id, [])
-    for gf in gfs:
+    user_id = data.get("userId", ""); geofence_id = data.get("geofenceId", "")
+    threshold = int(data.get("threshold", 0))
+    for gf in user_geofences.get(user_id, []):
         if gf["id"] == geofence_id:
             gf["threshold"] = threshold
             return {"message": "✅ Kota güncellendi"}
@@ -1531,10 +1456,9 @@ def geofence_rename(data: GeofenceRenameModel):
     room = rooms.get(data.roomName)
     if not room:
         raise HTTPException(status_code=404, detail="Oda bulunamadı")
-    if room.get("createdBy") != data.adminId and not is_super_admin(data.adminId, "", ""):
+    if room.get("createdBy") != data.adminId and not is_super_admin(data.adminId):
         raise HTTPException(status_code=403, detail="Sadece oda admini veya süper admin yeniden adlandırabilir")
-    gfs = room_geofences.get(data.roomName, [])
-    for gf in gfs:
+    for gf in room_geofences.get(data.roomName, []):
         if gf["id"] == data.geofenceId:
             gf["name"] = data.newName
             return {"message": "✅ İsim güncellendi"}
@@ -1543,11 +1467,9 @@ def geofence_rename(data: GeofenceRenameModel):
 @app.delete("/geofence/delete/{room_name}/{geofence_id}")
 def geofence_delete(room_name: str, geofence_id: str, admin_id: str):
     room = rooms.get(room_name)
-    if not room or (room.get("createdBy") != admin_id and not is_super_admin(admin_id, "", "")):
+    if not room or (room.get("createdBy") != admin_id and not is_super_admin(admin_id)):
         raise HTTPException(status_code=403, detail="Yetkisiz")
-    gfs = room_geofences.get(room_name, [])
-    room_geofences[room_name] = [g for g in gfs if g["id"] != geofence_id]
-    geofence_entries.pop(f"*_{geofence_id}", None)
+    room_geofences[room_name] = [g for g in room_geofences.get(room_name, []) if g["id"] != geofence_id]
     for k in list(geofence_entries.keys()):
         if k.endswith(f"_{geofence_id}"):
             del geofence_entries[k]
@@ -1557,24 +1479,14 @@ def geofence_delete(room_name: str, geofence_id: str, admin_id: str):
 # 🗺️ GRUP ROTASI
 # ═══════════════════════════════════════════════════════════════════════════════
 
-shared_routes = {}   # roomName → {sharedBy, waypoints: [{lat,lng}], active, sharedAt}
-
-class ShareRouteModel(BaseModel):
-    roomName: str
-    sharedBy: str
-    waypoints: list   # [{lat, lng}]
-
 @app.post("/share_route")
 def share_route(data: ShareRouteModel):
     room = rooms.get(data.roomName)
     if not room:
         raise HTTPException(status_code=404, detail="Oda bulunamadı")
-    now = datetime.now(DEFAULT_TIMEZONE).strftime("%Y-%m-%d %H:%M:%S")
     shared_routes[data.roomName] = {
-        "sharedBy":  data.sharedBy,
-        "waypoints": data.waypoints,
-        "active":    True,
-        "sharedAt":  now,
+        "sharedBy": data.sharedBy, "waypoints": data.waypoints,
+        "active": True, "sharedAt": get_local_time(),
     }
     return {"message": "✅ Rota paylaşıldı"}
 
@@ -1597,13 +1509,8 @@ def clear_shared_route(room_name: str, admin_id: str):
     return {"message": "✅ Rota temizlendi"}
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 👢 KULLANICI ATMA
+# 🚪 KULLANICI ATMA / BAN
 # ═══════════════════════════════════════════════════════════════════════════════
-
-kicked_users = {}   # userId → {roomName, kickedAt, kickedBy}
-banned_users  = {}  # userId → {bannedAt, bannedBy, reason, deviceId}
-banned_devices = {} # deviceId → {bannedAt, bannedBy, reason}
-muted_users   = {}  # userId → {mutedAt, mutedBy, reason}  (süper admin susturma)
 
 @app.post("/kick_user/{room_name}/{target_user}")
 def kick_user(room_name: str, target_user: str, admin_id: str,
@@ -1611,120 +1518,75 @@ def kick_user(room_name: str, target_user: str, admin_id: str,
     room = rooms.get(room_name)
     if not room:
         raise HTTPException(status_code=404, detail="Oda bulunamadı")
-    # Oda kurucusu VEYA süper admin atabilir
-    is_creator   = room.get("createdBy") == admin_id
-    is_sadmin    = is_super_admin(admin_id, device_id, token)
+    is_creator = room.get("createdBy") == admin_id
+    is_sadmin  = is_super_admin(admin_id, device_id, token)
     if not is_creator and not is_sadmin:
         raise HTTPException(status_code=403, detail="Sadece oda admini veya süper admin atabilir")
     if target_user == admin_id:
         raise HTTPException(status_code=400, detail="Kendinizi atamazsınız")
-    # Süper admin hiç kimse tarafından atılamaz
-    target_device = locations.get(target_user, {}).get("deviceId", "")
     target_is_sadmin = any(
         s["userId"] == target_user and datetime.now(DEFAULT_TIMEZONE) < s["expiresAt"]
         for s in _super_admin_sessions.values()
     )
     if target_is_sadmin and not is_sadmin:
         raise HTTPException(status_code=403, detail="Süper admini atamazsınız")
-    # Odanın kurucusunu başkası atamaz (sadece süper admin atabilir)
     if room.get("createdBy") == target_user and not is_sadmin:
         raise HTTPException(status_code=403, detail="Oda kurucusunu atamazsınız")
-    now = datetime.now(DEFAULT_TIMEZONE).strftime("%Y-%m-%d %H:%M:%S")
-    if target_user in locations:
-        if locations[target_user].get("roomName") == room_name:
-            locations[target_user]["roomName"] = "Genel"
+    now = get_local_time()
+    if target_user in locations and locations[target_user].get("roomName") == room_name:
+        locations[target_user]["roomName"] = "Genel"
     kicked_users[target_user] = {"roomName": room_name, "kickedAt": now, "kickedBy": admin_id}
     return {"message": f"✅ {target_user} odadan atıldı"}
 
 @app.post("/super_admin_ban")
 def super_admin_ban(data: dict):
-    """Süper admin: kullanıcıyı banla (uygulamadan at + tekrar girişi engelle)"""
-    admin_id  = data.get("adminId", "")
-    token     = data.get("token", "")
-    device_id = data.get("deviceId", "")
-    target    = data.get("targetUser", "").strip()
+    admin_id  = data.get("adminId", ""); token = data.get("token", "")
+    device_id = data.get("deviceId", ""); target = data.get("targetUser", "").strip()
     reason    = data.get("reason", "Süper admin kararı").strip()
-
     if not is_super_admin(admin_id, device_id, token):
         raise HTTPException(403, "Yetkisiz")
-    if not target:
-        raise HTTPException(400, "Hedef kullanıcı belirtilmedi")
-    if target == admin_id:
-        raise HTTPException(400, "Kendinizi banlayamazsınız")
-
-    now = datetime.now(DEFAULT_TIMEZONE).strftime("%Y-%m-%d %H:%M:%S")
+    if not target: raise HTTPException(400, "Hedef kullanıcı belirtilmedi")
+    if target == admin_id: raise HTTPException(400, "Kendinizi banlayamazsınız")
+    now = get_local_time()
     target_device = locations.get(target, {}).get("deviceId", "")
-
-    # Ban kaydı
-    banned_users[target] = {
-        "bannedAt": now, "bannedBy": admin_id,
-        "reason": reason, "deviceId": target_device,
-    }
+    banned_users[target]  = {"bannedAt": now, "bannedBy": admin_id, "reason": reason, "deviceId": target_device}
     if target_device:
-        banned_devices[target_device] = {
-            "bannedAt": now, "bannedBy": admin_id, "reason": reason,
-        }
-
-    # Kullanıcıyı Genel'e taşı (lokasyonda kalır ama sadece diğer banlıları görür)
+        banned_devices[target_device] = {"bannedAt": now, "bannedBy": admin_id, "reason": reason}
     if target in locations:
         locations[target]["roomName"] = "Genel"
-
-    # Kick sinyali → Flutter "⛔ BAN" içerdiğinde banlı moduna geçer
-    kicked_users[target] = {
-        "roomName": "Genel",
-        "kickedAt": now, "kickedBy": f"⛔ BAN: {admin_id}",
-    }
-    return {"message": f"⛔ {target} banlandı"}
+    kicked_users[target] = {"roomName": "Genel", "kickedAt": now, "kickedBy": f"⛔ BAN: {admin_id}"}
+    return {"message": f"✅ {target} banlandı"}
 
 @app.post("/super_admin_unban")
 def super_admin_unban(data: dict):
-    """Süper admin: banı kaldır"""
-    admin_id  = data.get("adminId", "")
-    token     = data.get("token", "")
-    device_id = data.get("deviceId", "")
-    target    = data.get("targetUser", "").strip()
-
+    admin_id = data.get("adminId", ""); token = data.get("token", "")
+    device_id = data.get("deviceId", ""); target = data.get("targetUser", "").strip()
     if not is_super_admin(admin_id, device_id, token):
         raise HTTPException(403, "Yetkisiz")
-
     device = banned_users.get(target, {}).get("deviceId", "")
     banned_users.pop(target, None)
-    if device:
-        banned_devices.pop(device, None)
+    if device: banned_devices.pop(device, None)
     return {"message": f"✅ {target} banı kaldırıldı"}
 
 @app.post("/super_admin_mute")
 def super_admin_mute(data: dict):
-    """Süper admin: kullanıcıyı sustur (mesaj + ses yetkileri kaldır)"""
-    admin_id  = data.get("adminId", "")
-    token     = data.get("token", "")
-    device_id = data.get("deviceId", "")
-    target    = data.get("targetUser", "").strip()
-    reason    = data.get("reason", "Süper admin kararı").strip()
-
+    admin_id = data.get("adminId", ""); token = data.get("token", "")
+    device_id = data.get("deviceId", ""); target = data.get("targetUser", "").strip()
+    reason = data.get("reason", "Süper admin kararı").strip()
     if not is_super_admin(admin_id, device_id, token):
         raise HTTPException(403, "Yetkisiz")
-    if not target:
-        raise HTTPException(400, "Hedef kullanıcı belirtilmedi")
-
-    now = datetime.now(DEFAULT_TIMEZONE).strftime("%Y-%m-%d %H:%M:%S")
+    if not target: raise HTTPException(400, "Hedef kullanıcı belirtilmedi")
+    now = get_local_time()
     muted_users[target] = {"mutedAt": now, "mutedBy": admin_id, "reason": reason}
-
-    # Tüm odalardaki ses yetkisini de kaldır
     for room in rooms.values():
         va = room.get("voiceAllowed", [])
-        if target in va:
-            va.remove(target)
+        if target in va: va.remove(target)
     return {"message": f"🔇 {target} susturuldu"}
 
 @app.post("/super_admin_unmute")
 def super_admin_unmute(data: dict):
-    """Süper admin: susturmayı kaldır"""
-    admin_id  = data.get("adminId", "")
-    token     = data.get("token", "")
-    device_id = data.get("deviceId", "")
-    target    = data.get("targetUser", "").strip()
-
+    admin_id = data.get("adminId", ""); token = data.get("token", "")
+    device_id = data.get("deviceId", ""); target = data.get("targetUser", "").strip()
     if not is_super_admin(admin_id, device_id, token):
         raise HTTPException(403, "Yetkisiz")
     muted_users.pop(target, None)
@@ -1732,28 +1594,17 @@ def super_admin_unmute(data: dict):
 
 @app.post("/super_admin_kick")
 def super_admin_kick(data: dict):
-    """Süper admin: kullanıcıyı bulunduğu odadan at"""
-    admin_id  = data.get("adminId", "")
-    token     = data.get("token", "")
-    device_id = data.get("deviceId", "")
-    target    = data.get("targetUser", "").strip()
-
+    admin_id = data.get("adminId", ""); token = data.get("token", "")
+    device_id = data.get("deviceId", ""); target = data.get("targetUser", "").strip()
     if not is_super_admin(admin_id, device_id, token):
         raise HTTPException(403, "Yetkisiz")
-    if not target:
-        raise HTTPException(400, "Hedef kullanıcı belirtilmedi")
-
-    now = datetime.now(DEFAULT_TIMEZONE).strftime("%Y-%m-%d %H:%M:%S")
+    if not target: raise HTTPException(400, "Hedef kullanıcı belirtilmedi")
+    now = get_local_time()
     room = locations.get(target, {}).get("roomName", "Genel")
-
     if room == "Genel":
         raise HTTPException(400, f"{target} zaten Genel odada")
-
-    # Odadan Genel'e taşı
     if target in locations:
         locations[target]["roomName"] = "Genel"
-
-    # Kick sinyali
     kicked_users[target] = {"roomName": room, "kickedAt": now, "kickedBy": f"⚡ {admin_id}"}
     return {"message": f"🚪 {target} odadan atıldı ({room})"}
 
@@ -1772,15 +1623,10 @@ def check_kicked(user_id: str):
     kick = kicked_users.get(user_id)
     if not kick:
         return {"kicked": False}
-    # Bir kez okunduktan sonra temizle
     del kicked_users[user_id]
     is_ban = "BAN" in str(kick.get("kickedBy", ""))
-    return {
-        "kicked":   True,
-        "isBan":    is_ban,
-        "roomName": kick["roomName"],
-        "kickedBy": kick["kickedBy"],
-    }
+    return {"kicked": True, "isBan": is_ban,
+            "roomName": kick["roomName"], "kickedBy": kick["kickedBy"]}
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # 🔧 YÖNETİM
@@ -1794,9 +1640,11 @@ def remove_user(user_id: str):
 
 @app.delete("/clear")
 def clear_all():
+    global _save_pending
     locations.clear(); location_history.clear(); pins.clear()
     scores.clear(); pin_collection_history.clear(); messages.clear()
     room_messages.clear(); walkie_queue.clear(); room_walkie_queue.clear()
     voice_messages.clear(); room_voice_messages.clear()
     sos_alerts.clear(); music_broadcasts.clear(); permission_requests.clear()
+    _save_pending = True
     return {"message": "✅ Tüm veriler silindi"}
