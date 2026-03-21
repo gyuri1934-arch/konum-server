@@ -241,6 +241,8 @@ class LocationModel(BaseModel):
     animationType: str = "pulse"
     roomName: str = "Genel"
     character: str = "🧍"
+    permMsg: str = "odadakiler"
+    permLocationHist: str = "yonetici"
 
 class RoomModel(BaseModel):
     roomName: str
@@ -716,6 +718,7 @@ def update_location(data: LocationModel):
         "lat": data.lat, "lng": data.lng, "altitude": data.altitude,
         "speed": data.speed, "animationType": data.animationType,
         "roomName": data.roomName, "character": data.character,
+        "permMsg": data.permMsg, "permLocationHist": data.permLocationHist,
         "lastSeen": now, "idleStatus": idle_status,
         "idleMinutes": idle_minutes, "idleStart": idle_start,
     }
@@ -767,6 +770,8 @@ def get_locations(room_name: str, viewer_id: str = "", viewer_device_id: str = "
             "isHidden": False,
             "isRoomAdmin": is_room_admin,
             "isSuperAdmin": is_super_now,
+            "permMsg": data.get("permMsg", "odadakiler"),
+            "permLocationHist": data.get("permLocationHist", "yonetici"),
         })
     return result
 
