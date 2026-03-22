@@ -175,6 +175,12 @@ muted_users   = {}
 # ─── Paylaşılan rotalar ───────────────────────────────────────────────────────
 shared_routes = {}
 
+# ─── Transport modu rolleri ───────────────────────────────────────────────────
+transport_roles: dict = {}    # roomName → {userId → {role, vehicleName, joinedAt}}
+transport_broadcasts: dict = {}  # roomName → {id, fromUser, vehicleName, message, timestamp}
+transport_stops: dict = {}     # roomName → {stopId → {id,name,lat,lng,radius,addedBy,addedByRole,createdAt}}
+transport_arrivals: dict = {}  # roomName → [{id,stopId,stopName,userId,character,arrivalTime}]
+
 # ─── Rota kütüphanesi (kullanıcılar arası paylaşım) ──────────────────────────
 route_library: dict = {}  # roomName → [{id, name, creator, waypoints, distKm, durMin, createdAt}]
 
@@ -822,6 +828,7 @@ def get_locations(room_name: str, viewer_id: str = "", viewer_device_id: str = "
             "isSuperAdmin": is_super_now,
             "permMsg": data.get("permMsg", "odadakiler"),
             "permLocationHist": data.get("permLocationHist", "yonetici"),
+            "transportRole": transport_roles.get(data.get("roomName",""), {}).get(uid, {}).get("role", ""),
         })
     return result
 
@@ -1795,3 +1802,131 @@ def clear_all():
     sos_alerts.clear(); music_broadcasts.clear(); permission_requests.clear()
     _save_pending = True
     return {"message": "✅ Tüm veriler silindi"}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 🚌 TRANSPORT MODU
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@app.post("/set_transport_role")
+def set_transport_role(data: dict):
+    room = data.get("roomName", "Genel")
+    uid = data.get("userId", "")
+    role = data.get("role", "")
+    vehicle = data.get("vehicleName", "")
+    if not uid:
+        raise HTTPException(400, "userId gerekli")
+    if room not in transport_roles:
+        transport_roles[room] = {}
+    if role:
+        transport_roles[room][uid] = {
+            "role": role,
+            "vehicleName": vehicle,
+            "joinedAt": get_local_time(),
+        }
+    else:
+        transport_roles[room].pop(uid, None)
+    return {"ok": True}
+
+@app.get("/get_transport_status/{room_name}")
+def get_transport_status(room_name: str):
+    roles = transport_roles.get(room_name, {})
+    drivers, passengers, managers = [], [], []
+    for uid, info in roles.items():
+        loc = locations.get(uid, {})
+        if not is_user_online(loc.get("lastSeen", "")):
+            continue
+        entry = {
+            "userId": uid,
+            "role": info["role"],
+            "vehicleName": info.get("vehicleName", ""),
+            "character": loc.get("character", "🧍"),
+            "lat": loc.get("lat", 0),
+            "lng": loc.get("lng", 0),
+            "speed": loc.get("speed", 0),
+        }
+        if info["role"] == "driver":
+            drivers.append(entry)
+        elif info["role"] == "passenger":
+            passengers.append(entry)
+        elif info["role"] == "manager":
+            managers.append(entry)
+    return {"drivers": drivers, "passengers": passengers, "managers": managers}
+
+@app.post("/transport_broadcast")
+def transport_broadcast_msg(data: dict):
+    room = data.get("roomName", "Genel")
+    uid = data.get("fromUser", "")
+    msg = data.get("message", "")
+    if not msg:
+        raise HTTPException(400, "Mesaj boş olamaz")
+    vehicle = transport_roles.get(room, {}).get(uid, {}).get("vehicleName", "")
+    transport_broadcasts[room] = {
+        "id": str(uuid.uuid4())[:8],
+        "fromUser": uid,
+        "vehicleName": vehicle,
+        "message": msg,
+        "timestamp": get_local_time(),
+    }
+    return {"ok": True}
+
+@app.get("/get_transport_broadcast/{room_name}")
+def get_transport_broadcast(room_name: str):
+    return transport_broadcasts.get(room_name, {})
+
+# ─── Transport Durak (Stop) Yönetimi ─────────────────────────────────────────
+
+class TransportStopModel(BaseModel):
+    roomName: str
+    id: str
+    name: str
+    lat: float
+    lng: float
+    radius: float = 80.0
+    addedBy: str = ""
+    addedByRole: str = ""
+
+@app.post("/transport_stop")
+def add_transport_stop(data: TransportStopModel):
+    if data.roomName not in transport_stops:
+        transport_stops[data.roomName] = {}
+    transport_stops[data.roomName][data.id] = {
+        "id": data.id, "name": data.name,
+        "lat": data.lat, "lng": data.lng,
+        "radius": data.radius,
+        "addedBy": data.addedBy,
+        "addedByRole": data.addedByRole,
+        "createdAt": get_local_time(),
+    }
+    return {"ok": True}
+
+@app.get("/transport_stops/{room_name}")
+def get_transport_stops(room_name: str):
+    return {"stops": list(transport_stops.get(room_name, {}).values())}
+
+@app.delete("/transport_stop/{room_name}/{stop_id}")
+def delete_transport_stop(room_name: str, stop_id: str):
+    transport_stops.get(room_name, {}).pop(stop_id, None)
+    return {"ok": True}
+
+@app.post("/transport_arrival")
+def report_transport_arrival(data: dict):
+    room = data.get("roomName", "Genel")
+    if room not in transport_arrivals:
+        transport_arrivals[room] = []
+    entry = {
+        "id": str(uuid.uuid4())[:8],
+        "stopId": data.get("stopId", ""),
+        "stopName": data.get("stopName", ""),
+        "userId": data.get("userId", ""),
+        "character": data.get("character", "🧍"),
+        "arrivalTime": get_local_time(),
+    }
+    # Keep last 50 arrivals per room
+    transport_arrivals[room].append(entry)
+    if len(transport_arrivals[room]) > 50:
+        transport_arrivals[room] = transport_arrivals[room][-50:]
+    return {"ok": True}
+
+@app.get("/transport_arrivals/{room_name}")
+def get_transport_arrivals(room_name: str):
+    return {"arrivals": transport_arrivals.get(room_name, [])}
