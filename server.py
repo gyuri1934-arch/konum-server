@@ -50,8 +50,10 @@ app.add_middleware(
 # 💾 DISK KALICILIĞI — Fly.io volume /data'ya mount edilmişse persist eder
 # ═══════════════════════════════════════════════════════════════════════════════
 
-_DATA_DIR    = "/data" if os.path.isdir("/data") else os.path.dirname(os.path.abspath(__file__))
-HISTORY_FILE = os.path.join(_DATA_DIR, "location_history.json")
+_DATA_DIR           = "/data" if os.path.isdir("/data") else os.path.dirname(os.path.abspath(__file__))
+HISTORY_FILE        = os.path.join(_DATA_DIR, "location_history.json")
+ROUTE_LIBRARY_FILE  = os.path.join(_DATA_DIR, "route_library.json")
+ROUTE_WAYPOINTS_FILE= os.path.join(_DATA_DIR, "route_waypoints.json")
 _save_pending = False
 
 def _flush_history():
@@ -72,9 +74,25 @@ async def _periodic_save():
             _flush_history()
             _save_pending = False
 
+def _flush_route_library():
+    try:
+        os.makedirs(_DATA_DIR, exist_ok=True)
+        with open(ROUTE_LIBRARY_FILE, 'w', encoding='utf-8') as f:
+            json.dump(route_library, f, ensure_ascii=False)
+    except Exception as e:
+        print(f"❌ Rota kütüphanesi kayıt hatası: {e}")
+
+def _flush_route_waypoints():
+    try:
+        os.makedirs(_DATA_DIR, exist_ok=True)
+        with open(ROUTE_WAYPOINTS_FILE, 'w', encoding='utf-8') as f:
+            json.dump(room_route_waypoints, f, ensure_ascii=False)
+    except Exception as e:
+        print(f"❌ POI noktaları kayıt hatası: {e}")
+
 @app.on_event("startup")
 async def startup_event():
-    global location_history
+    global location_history, route_library, room_route_waypoints
     try:
         if os.path.exists(HISTORY_FILE):
             with open(HISTORY_FILE, 'r', encoding='utf-8') as f:
@@ -86,12 +104,30 @@ async def startup_event():
             print("ℹ️ Geçmiş dosyası yok — temiz başlangıç")
     except Exception as e:
         print(f"❌ Geçmiş yükleme hatası: {e}")
+    try:
+        if os.path.exists(ROUTE_LIBRARY_FILE):
+            with open(ROUTE_LIBRARY_FILE, 'r', encoding='utf-8') as f:
+                route_library.update(json.load(f))
+            total_routes = sum(len(v) for v in route_library.values())
+            print(f"✅ Rota kütüphanesi yüklendi: {total_routes} rota")
+    except Exception as e:
+        print(f"❌ Rota kütüphanesi yükleme hatası: {e}")
+    try:
+        if os.path.exists(ROUTE_WAYPOINTS_FILE):
+            with open(ROUTE_WAYPOINTS_FILE, 'r', encoding='utf-8') as f:
+                room_route_waypoints.update(json.load(f))
+            total_pois = sum(len(v) for v in room_route_waypoints.values())
+            print(f"✅ POI noktaları yüklendi: {total_pois} nokta")
+    except Exception as e:
+        print(f"❌ POI noktaları yükleme hatası: {e}")
     asyncio.create_task(_periodic_save())
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    print("💾 Kapatılıyor — geçmiş kaydediliyor...")
+    print("💾 Kapatılıyor — veriler kaydediliyor...")
     _flush_history()
+    _flush_route_library()
+    _flush_route_waypoints()
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # 🗄️ VERİ SAKLAMASI (RAM)
@@ -138,6 +174,12 @@ muted_users   = {}
 
 # ─── Paylaşılan rotalar ───────────────────────────────────────────────────────
 shared_routes = {}
+
+# ─── Rota kütüphanesi (kullanıcılar arası paylaşım) ──────────────────────────
+route_library: dict = {}  # roomName → [{id, name, creator, waypoints, distKm, durMin, createdAt}]
+
+# ─── Oda POI noktaları (mola/kamp/vb.) ───────────────────────────────────────
+room_route_waypoints: dict = {}  # roomName → [{id, icon, name, lat, lng, radius, color, cap, geofenceActive, desc, createdBy}]
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # 🔐 SÜPER ADMİN
@@ -362,6 +404,14 @@ class ShareRouteModel(BaseModel):
     roomName: str
     sharedBy: str
     waypoints: list
+
+class RouteLibraryModel(BaseModel):
+    roomName: str
+    name: str
+    creator: str
+    waypoints: list
+    distKm: Optional[float] = None
+    durMin: Optional[int] = None
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # 🏠 ANA SAYFA
@@ -1512,6 +1562,98 @@ def clear_shared_route(room_name: str, admin_id: str):
         raise HTTPException(status_code=403, detail="Sadece admin silebilir")
     shared_routes[room_name] = {"active": False}
     return {"message": "✅ Rota temizlendi"}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 📚 ROTA KÜTÜPHANESİ
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@app.post("/route_library")
+def add_route_library(data: RouteLibraryModel):
+    if data.roomName not in route_library:
+        route_library[data.roomName] = []
+    route_id = str(uuid.uuid4())[:8]
+    route_library[data.roomName].append({
+        "id": route_id,
+        "name": data.name,
+        "creator": data.creator,
+        "waypoints": data.waypoints,
+        "distKm": data.distKm,
+        "durMin": data.durMin,
+        "createdAt": get_local_time(),
+    })
+    _flush_route_library()
+    return {"id": route_id, "message": "✅ Rota kütüphaneye eklendi"}
+
+@app.get("/route_library/{room_name}")
+def get_route_library(room_name: str):
+    return {"routes": route_library.get(room_name, [])}
+
+@app.delete("/route_library/{room_name}/{route_id}")
+def delete_route_library(room_name: str, route_id: str, user_id: str):
+    lib = route_library.get(room_name, [])
+    route = next((r for r in lib if r["id"] == route_id), None)
+    if not route:
+        raise HTTPException(status_code=404, detail="Rota bulunamadı")
+    if route["creator"] != user_id and not is_super_admin(user_id):
+        raise HTTPException(status_code=403, detail="Sadece oluşturan silebilir")
+    route_library[room_name] = [r for r in lib if r["id"] != route_id]
+    _flush_route_library()
+    return {"message": "✅ Silindi"}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 📌 ODA POI NOKTALARI (mola/kamp/vb.)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class RoomPoiModel(BaseModel):
+    roomName: str
+    id: str
+    icon: str
+    name: str
+    lat: float
+    lng: float
+    radius: float = 50.0
+    color: int = 0
+    cap: int = 0
+    geofenceActive: bool = False
+    desc: str = ""
+    createdBy: str = ""
+
+@app.post("/route_waypoints")
+def add_room_poi(data: RoomPoiModel):
+    if data.roomName not in room_route_waypoints:
+        room_route_waypoints[data.roomName] = []
+    # Aynı id varsa güncelle, yoksa ekle
+    wps = room_route_waypoints[data.roomName]
+    idx = next((i for i, w in enumerate(wps) if w["id"] == data.id), None)
+    entry = {
+        "id": data.id, "icon": data.icon, "name": data.name,
+        "lat": data.lat, "lng": data.lng, "radius": data.radius,
+        "color": data.color, "cap": data.cap,
+        "geofenceActive": data.geofenceActive, "desc": data.desc,
+        "createdBy": data.createdBy, "updatedAt": get_local_time(),
+    }
+    if idx is not None:
+        wps[idx] = entry
+    else:
+        wps.append(entry)
+    _flush_route_waypoints()
+    return {"message": "✅ POI kaydedildi"}
+
+@app.get("/route_waypoints/{room_name}")
+def get_room_pois(room_name: str):
+    return {"waypoints": room_route_waypoints.get(room_name, [])}
+
+@app.delete("/route_waypoints/{room_name}/{poi_id}")
+def delete_room_poi(room_name: str, poi_id: str, user_id: str = ""):
+    wps = room_route_waypoints.get(room_name, [])
+    poi = next((w for w in wps if w["id"] == poi_id), None)
+    if not poi:
+        raise HTTPException(status_code=404, detail="POI bulunamadı")
+    if user_id and poi.get("createdBy") and poi["createdBy"] != user_id and not is_super_admin(user_id):
+        raise HTTPException(status_code=403, detail="Sadece oluşturan silebilir")
+    room_route_waypoints[room_name] = [w for w in wps if w["id"] != poi_id]
+    _flush_route_waypoints()
+    return {"message": "✅ POI silindi"}
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # 🚪 KULLANICI ATMA / BAN
