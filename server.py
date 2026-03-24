@@ -218,7 +218,7 @@ def is_super_admin(user_id: str, device_id: str = "", token: str = "") -> bool:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 DEFAULT_TIMEZONE   = pytz.timezone('Europe/Istanbul')
-USER_TIMEOUT       = 120
+USER_TIMEOUT       = 180
 IDLE_THRESHOLD     = 15
 IDLE_TIME_MINUTES  = 15
 SPEED_VEHICLE      = 30
@@ -418,6 +418,12 @@ class RouteLibraryModel(BaseModel):
     waypoints: list
     distKm: Optional[float] = None
     durMin: Optional[int] = None
+    startDate: Optional[str] = None
+    endDate: Optional[str] = None
+    announceDate: Optional[str] = None
+    announceEndDate: Optional[str] = None
+    info: Optional[str] = None
+    maxParticipants: Optional[int] = None
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # 🏠 ANA SAYFA
@@ -802,7 +808,7 @@ def get_locations(room_name: str, viewer_id: str = "", viewer_device_id: str = "
         if vis["mode"] == "hidden":
             continue
         if vis["mode"] == "room":
-            viewer_room = locations.get(viewer_id, {}).get("roomName", "Genel")
+            viewer_room = locations.get(viewer_id, {}).get("roomName", room_name)
             if viewer_room != data.get("roomName"):
                 continue
         user_room = data.get("roomName", "Genel")
@@ -1587,6 +1593,14 @@ def add_route_library(data: RouteLibraryModel):
         "distKm": data.distKm,
         "durMin": data.durMin,
         "createdAt": get_local_time(),
+        "startDate": data.startDate,
+        "endDate": data.endDate,
+        "announceDate": data.announceDate,
+        "announceEndDate": data.announceEndDate,
+        "info": data.info,
+        "maxParticipants": data.maxParticipants,
+        "participants": [],
+        "likes": [],
     })
     _flush_route_library()
     return {"id": route_id, "message": "✅ Rota kütüphaneye eklendi"}
@@ -1594,6 +1608,49 @@ def add_route_library(data: RouteLibraryModel):
 @app.get("/route_library/{room_name}")
 def get_route_library(room_name: str):
     return {"routes": route_library.get(room_name, [])}
+
+@app.post("/route_library/{room_name}/{route_id}/join")
+def join_route_organization(room_name: str, route_id: str, user_id: str):
+    lib = route_library.get(room_name, [])
+    route = next((r for r in lib if r["id"] == route_id), None)
+    if not route:
+        raise HTTPException(status_code=404, detail="Rota bulunamadı")
+    participants = route.setdefault("participants", [])
+    max_p = route.get("maxParticipants")
+    if max_p and len(participants) >= max_p:
+        raise HTTPException(status_code=400, detail="Organizasyon dolu")
+    if user_id not in participants:
+        participants.append(user_id)
+        _flush_route_library()
+    return {"message": "✅ Katıldınız", "participants": participants, "creator": route.get("creator", ""), "routeName": route.get("name", "")}
+
+@app.delete("/route_library/{room_name}/{route_id}/join")
+def leave_route_organization(room_name: str, route_id: str, user_id: str):
+    lib = route_library.get(room_name, [])
+    route = next((r for r in lib if r["id"] == route_id), None)
+    if not route:
+        raise HTTPException(status_code=404, detail="Rota bulunamadı")
+    participants = route.setdefault("participants", [])
+    if user_id in participants:
+        participants.remove(user_id)
+        _flush_route_library()
+    return {"message": "✅ Ayrıldınız", "participants": participants}
+
+@app.post("/route_library/{room_name}/{route_id}/like")
+def toggle_like_route(room_name: str, route_id: str, user_id: str):
+    lib = route_library.get(room_name, [])
+    route = next((r for r in lib if r["id"] == route_id), None)
+    if not route:
+        raise HTTPException(status_code=404, detail="Rota bulunamadı")
+    likes = route.setdefault("likes", [])
+    if user_id in likes:
+        likes.remove(user_id)
+        liked = False
+    else:
+        likes.append(user_id)
+        liked = True
+    _flush_route_library()
+    return {"liked": liked, "likes": len(likes)}
 
 @app.delete("/route_library/{room_name}/{route_id}")
 def delete_route_library(room_name: str, route_id: str, user_id: str):
@@ -1920,6 +1977,7 @@ def report_transport_arrival(data: dict):
         "userId": data.get("userId", ""),
         "character": data.get("character", "🧍"),
         "arrivalTime": get_local_time(),
+        "boarding": bool(data.get("boarding", False)),
     }
     # Keep last 50 arrivals per room
     transport_arrivals[room].append(entry)
