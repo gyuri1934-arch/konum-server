@@ -1,7 +1,7 @@
 # ═══════════════════════════════════════════════════════════════════════════════
 #                         KONUM TAKİP SERVER
 # ═══════════════════════════════════════════════════════════════════════════════
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.exceptions import RequestValidationError
@@ -50,11 +50,16 @@ app.add_middleware(
 # 💾 DISK KALICILIĞI — Fly.io volume /data'ya mount edilmişse persist eder
 # ═══════════════════════════════════════════════════════════════════════════════
 
-_DATA_DIR           = "/data" if os.path.isdir("/data") else os.path.dirname(os.path.abspath(__file__))
-HISTORY_FILE        = os.path.join(_DATA_DIR, "location_history.json")
-ROUTE_LIBRARY_FILE  = os.path.join(_DATA_DIR, "route_library.json")
-ROUTE_WAYPOINTS_FILE= os.path.join(_DATA_DIR, "route_waypoints.json")
-_save_pending = False
+_DATA_DIR            = "/data" if os.path.isdir("/data") else os.path.dirname(os.path.abspath(__file__))
+HISTORY_FILE         = os.path.join(_DATA_DIR, "location_history.json")
+ROUTE_LIBRARY_FILE   = os.path.join(_DATA_DIR, "route_library.json")
+ROUTE_WAYPOINTS_FILE = os.path.join(_DATA_DIR, "route_waypoints.json")
+CRITICAL_DATA_FILE   = os.path.join(_DATA_DIR, "critical_data.json")
+_save_pending          = False
+_critical_save_pending = False
+
+# Ses/walkie mesajı maksimum boyutu (~2MB base64 ≈ 1.5MB ses)
+MAX_AUDIO_B64 = 2_000_000
 
 def _flush_history():
     """location_history'yi diske yaz."""
@@ -65,14 +70,104 @@ def _flush_history():
     except Exception as e:
         print(f"❌ History kayıt hatası: {e}")
 
+def _flush_critical_data():
+    """Restart'ta kaybolmaması gereken kritik verileri diske yaz."""
+    try:
+        os.makedirs(_DATA_DIR, exist_ok=True)
+        # Super admin sessionlarını serialize et (datetime → str)
+        sessions_str = {}
+        for tok, sess in _super_admin_sessions.items():
+            try:
+                exp = sess["expiresAt"]
+                sessions_str[tok] = {
+                    "userId":    sess["userId"],
+                    "expiresAt": exp.strftime("%Y-%m-%d %H:%M:%S") if hasattr(exp, "strftime") else str(exp),
+                    "deviceId":  sess.get("deviceId", ""),
+                }
+            except Exception:
+                pass
+        data = {
+            "rooms":                 rooms,
+            "messages":              messages,
+            "room_messages":         room_messages,
+            "pins":                  pins,
+            "scores":                scores,
+            "pin_collection_history":pin_collection_history,
+            "fcm_tokens":            fcm_tokens,
+            "visibility_settings":   visibility_settings,
+            "banned_users":          banned_users,
+            "banned_devices":        banned_devices,
+            "muted_users":           muted_users,
+            "user_geofences":        user_geofences,
+            "room_geofences":        room_geofences,
+            "transport_stops":       transport_stops,
+            "permission_requests":   permission_requests,
+            "friend_requests":       friend_requests,
+            "friends_map":           friends_map,
+            "super_admin_sessions":  sessions_str,
+        }
+        with open(CRITICAL_DATA_FILE, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False)
+    except Exception as e:
+        print(f"❌ Kritik veri kayıt hatası: {e}")
+
 async def _periodic_save():
-    """Her 60 saniyede bir bekleyen kayıt varsa diske yaz."""
-    global _save_pending
+    """Her 30 saniyede bir bekleyen kayıtları diske yaz."""
+    global _save_pending, _critical_save_pending
     while True:
-        await asyncio.sleep(60)
+        await asyncio.sleep(30)
         if _save_pending:
             _flush_history()
             _save_pending = False
+        if _critical_save_pending:
+            _flush_critical_data()
+            _critical_save_pending = False
+
+ROOM_AUTO_CLOSE_SECS = 3600  # 1 saat
+
+async def _auto_close_rooms():
+    """Boş kalan odaları 1 saat sonra otomatik siler (her 5 dakikada bir kontrol)."""
+    global _critical_save_pending
+    while True:
+        await asyncio.sleep(300)
+        now = datetime.now(DEFAULT_TIMEZONE)
+        to_delete = []
+        for room_name, room in list(rooms.items()):
+            online_count = sum(
+                1 for u in locations.values()
+                if u.get("roomName") == room_name and is_user_online(u.get("lastSeen", ""))
+            )
+            if online_count > 0:
+                # Aktif üye var → lastActivity güncelle
+                rooms[room_name]["lastActivity"] = now.strftime("%Y-%m-%d %H:%M:%S")
+                continue
+            # Üye yok → son aktivite zamanını kontrol et
+            last_str = room.get("lastActivity") or room.get("createdAt", "")
+            if not last_str:
+                continue
+            try:
+                last_dt = DEFAULT_TIMEZONE.localize(
+                    datetime.strptime(last_str, "%Y-%m-%d %H:%M:%S"))
+                if (now - last_dt).total_seconds() >= ROOM_AUTO_CLOSE_SECS:
+                    to_delete.append(room_name)
+            except Exception:
+                pass
+        for room_name in to_delete:
+            rooms.pop(room_name, None)
+            for uid in locations:
+                if locations[uid].get("roomName") == room_name:
+                    locations[uid]["roomName"] = "Genel"
+            for pin_id in list(pins.keys()):
+                if pins[pin_id].get("roomName") == room_name:
+                    del pins[pin_id]
+            for key in list(scores.keys()):
+                if key.startswith(f"{room_name}_"):
+                    del scores[key]
+            room_messages.pop(room_name, None)
+            room_walkie_queue.pop(room_name, None)
+            print(f"🗑️ '{room_name}' odası 1 saattir boş — otomatik silindi")
+        if to_delete:
+            _critical_save_pending = True
 
 def _flush_route_library():
     try:
@@ -93,6 +188,10 @@ def _flush_route_waypoints():
 @app.on_event("startup")
 async def startup_event():
     global location_history, route_library, room_route_waypoints
+    global rooms, messages, room_messages, pins, scores, pin_collection_history
+    global fcm_tokens, visibility_settings, banned_users, banned_devices, muted_users
+    global user_geofences, room_geofences, transport_stops, permission_requests
+    global friend_requests, friends_map
     try:
         if os.path.exists(HISTORY_FILE):
             with open(HISTORY_FILE, 'r', encoding='utf-8') as f:
@@ -120,7 +219,52 @@ async def startup_event():
             print(f"✅ POI noktaları yüklendi: {total_pois} nokta")
     except Exception as e:
         print(f"❌ POI noktaları yükleme hatası: {e}")
+    # Kritik veriler (odalar, mesajlar, pinler, ban listesi vb.)
+    try:
+        if os.path.exists(CRITICAL_DATA_FILE):
+            with open(CRITICAL_DATA_FILE, 'r', encoding='utf-8') as f:
+                d = json.load(f)
+            rooms.update(d.get("rooms", {}))
+            messages.update(d.get("messages", {}))
+            room_messages.update(d.get("room_messages", {}))
+            pins.update(d.get("pins", {}))
+            scores.update(d.get("scores", {}))
+            pin_collection_history.update(d.get("pin_collection_history", {}))
+            fcm_tokens.update(d.get("fcm_tokens", {}))
+            visibility_settings.update(d.get("visibility_settings", {}))
+            banned_users.update(d.get("banned_users", {}))
+            banned_devices.update(d.get("banned_devices", {}))
+            muted_users.update(d.get("muted_users", {}))
+            user_geofences.update(d.get("user_geofences", {}))
+            room_geofences.update(d.get("room_geofences", {}))
+            transport_stops.update(d.get("transport_stops", {}))
+            permission_requests.update(d.get("permission_requests", {}))
+            friend_requests.update(d.get("friend_requests", {}))
+            friends_map.update(d.get("friends_map", {}))
+            # Super admin sessionlarını geri yükle (süresi dolmayanları)
+            now_dt = datetime.now(DEFAULT_TIMEZONE)
+            loaded_sessions = 0
+            for tok, sess in d.get("super_admin_sessions", {}).items():
+                try:
+                    exp = DEFAULT_TIMEZONE.localize(
+                        datetime.strptime(sess["expiresAt"], "%Y-%m-%d %H:%M:%S"))
+                    if now_dt < exp:
+                        _super_admin_sessions[tok] = {
+                            "userId":    sess["userId"],
+                            "expiresAt": exp,
+                            "deviceId":  sess.get("deviceId", ""),
+                        }
+                        loaded_sessions += 1
+                except Exception:
+                    pass
+            print(f"✅ Kritik veriler yüklendi: {len(rooms)} oda, {len(messages)} konuşma, "
+                  f"{len(pins)} pin, {len(banned_users)} ban, {loaded_sessions} admin session")
+        else:
+            print("ℹ️ Kritik veri dosyası yok — temiz başlangıç")
+    except Exception as e:
+        print(f"❌ Kritik veri yükleme hatası: {e}")
     asyncio.create_task(_periodic_save())
+    asyncio.create_task(_auto_close_rooms())
 
 @app.on_event("shutdown")
 async def shutdown_event():
@@ -128,6 +272,7 @@ async def shutdown_event():
     _flush_history()
     _flush_route_library()
     _flush_route_waypoints()
+    _flush_critical_data()
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # 🗄️ VERİ SAKLAMASI (RAM)
@@ -141,6 +286,7 @@ pin_collection_history = {}
 pins = {}
 messages = {}
 room_messages = {}
+room_message_reads = {}   # {room_name: {user_id: lastReadMsgId}}
 visibility_settings = {}
 fcm_tokens = {}
 
@@ -148,12 +294,21 @@ fcm_tokens = {}
 walkie_queue = {}
 room_walkie_queue = {}
 
+# ─── Gerçek zamanlı sesli arama (WebSocket bağlantıları) ──────────────────────
+from collections import defaultdict
+_room_voice_ws: dict = defaultdict(set)   # room_name → {WebSocket, ...}
+_p2p_voice_ws:  dict = {}                 # user_id   → WebSocket
+
 # ─── Sesli mesajlar ───────────────────────────────────────────────────────────
 voice_messages = {}
 room_voice_messages = {}
 
 # ─── Yetki istekleri ──────────────────────────────────────────────────────────
 permission_requests = {}
+
+# ─── Arkadaşlık istekleri ─────────────────────────────────────────────────────
+friend_requests = {}  # req_id → {from, to, status, timestamp}
+friends_map     = {}  # user_id → [friend_ids]
 
 # ─── SOS uyarıları ────────────────────────────────────────────────────────────
 sos_alerts = {}
@@ -194,7 +349,7 @@ room_route_waypoints: dict = {}  # roomName → [{id, icon, name, lat, lng, radi
 SUPER_ADMIN_DEVICE_IDS: set = {}
 
 SUPER_ADMIN_CREDENTIALS: dict = {
-    "admin": "1234",
+    os.getenv("ADMIN_ID", "admin"): os.getenv("ADMIN_PASSWORD", "1234"),
 }
 
 _super_admin_sessions: dict = {}
@@ -258,6 +413,18 @@ def is_user_online(last_seen_str):
         return (now - last_seen).total_seconds() < USER_TIMEOUT
     except:
         return False
+
+def _ago_text(last_seen_str):
+    try:
+        last_seen = datetime.strptime(last_seen_str, "%Y-%m-%d %H:%M:%S")
+        last_seen = DEFAULT_TIMEZONE.localize(last_seen)
+        delta = int((datetime.now(DEFAULT_TIMEZONE) - last_seen).total_seconds())
+        if delta < 60:   return f"{delta}s önce"
+        if delta < 3600: return f"{delta//60}dk önce"
+        if delta < 86400:return f"{delta//3600}sa önce"
+        return f"{delta//86400}g önce"
+    except:
+        return "?"
 
 def cleanup_old_routes():
     cutoff = datetime.now(DEFAULT_TIMEZONE) - timedelta(days=MAX_HISTORY_DAYS)
@@ -389,6 +556,15 @@ class PermissionRespondModel(BaseModel):
     adminUserId: str
     approved: bool
 
+class FriendRequestModel(BaseModel):
+    fromUser: str
+    toUser:   str
+
+class FriendRespondModel(BaseModel):
+    requestId: str
+    toUser:    str
+    accepted:  bool
+
 class GeofenceSaveModel(BaseModel):
     roomName: str
     adminId: str
@@ -459,6 +635,7 @@ def create_room(data: RoomModel):
         raise HTTPException(status_code=400, detail="Bu oda adı zaten mevcut!")
     if len(data.password) < 3:
         raise HTTPException(status_code=400, detail="Şifre en az 3 karakter olmalı!")
+    global _critical_save_pending
     rooms[data.roomName] = {
         "name": data.roomName,
         "password": data.password,
@@ -467,6 +644,7 @@ def create_room(data: RoomModel):
         "collectors": [],
         "voiceAllowed": [],
     }
+    _critical_save_pending = True
     return {"message": f"✅ {data.roomName} odası oluşturuldu"}
 
 @app.post("/join_room")
@@ -507,11 +685,31 @@ def get_rooms(user_id: str = ""):
         })
     return result
 
-@app.delete("/delete_room/{room_name}")
-def delete_room(room_name: str, admin_id: str):
+@app.post("/rejoin_room")
+def rejoin_room(data: dict):
+    """Daha önce katılınan gruba şifre girmeden tekrar gir (oda yaratıcısı veya kayıtlı üye)."""
+    room_name = data.get("roomName", "")
+    user_id   = data.get("userId", "")
     if room_name not in rooms:
         raise HTTPException(status_code=404, detail="Oda bulunamadı!")
-    if rooms[room_name]["createdBy"] != admin_id:
+    room = rooms[room_name]
+    # Yaratıcı her zaman girebilir
+    if room["createdBy"] == user_id:
+        return {"message": f"✅ {room_name} grubuna girildi"}
+    # Daha önce bu odada konumu kayıtlı mı?
+    prev_room = locations.get(user_id, {}).get("roomName", "Genel")
+    if prev_room == room_name:
+        return {"message": f"✅ {room_name} grubuna girildi"}
+    raise HTTPException(status_code=403, detail="Bu gruba erişim izniniz yok!")
+
+@app.delete("/delete_room/{room_name}")
+def delete_room(room_name: str, admin_id: str, token: str = "", device_id: str = ""):
+    global _critical_save_pending
+    if room_name not in rooms:
+        raise HTTPException(status_code=404, detail="Oda bulunamadı!")
+    created_by = rooms[room_name].get("createdBy") or ""
+    is_creator = bool(created_by) and created_by == admin_id
+    if not is_creator and not is_super_admin(admin_id, device_id, token):
         raise HTTPException(status_code=403, detail="Sadece admin silebilir!")
     del rooms[room_name]
     for uid in locations:
@@ -527,7 +725,51 @@ def delete_room(room_name: str, admin_id: str):
         del room_messages[room_name]
     if room_name in room_walkie_queue:
         del room_walkie_queue[room_name]
+    _critical_save_pending = True
     return {"message": f"✅ {room_name} odası silindi"}
+
+@app.post("/resign_admin/{room_name}")
+def resign_admin(room_name: str, admin_id: str, new_name: str = ""):
+    """Admin rolünü bırak. new_name boşsa benzersiz misafir_xxxx adı üretilir."""
+    global _critical_save_pending
+    import random, string
+    if room_name not in rooms:
+        raise HTTPException(status_code=404, detail="Oda bulunamadı!")
+    if rooms[room_name].get("createdBy") != admin_id:
+        raise HTTPException(status_code=403, detail="Sadece oda admini bırakabilir!")
+
+    # Yeni ismi belirle
+    if new_name.strip():
+        final_name = new_name.strip()
+    else:
+        chars = "abcdefghjkmnpqrstuvwxyz23456789"
+        for _ in range(10):
+            suffix = "".join(random.choices(chars, k=4))
+            candidate = f"misafir_{suffix}"
+            if candidate not in locations:
+                final_name = candidate
+                break
+        else:
+            final_name = f"misafir_{random.randint(1000,9999)}"
+
+    # İsim çakışması kontrolü
+    if final_name != admin_id and final_name in locations:
+        existing = locations[final_name]
+        if is_user_online(existing.get("lastSeen", "")):
+            raise HTTPException(status_code=400, detail="Bu isim zaten kullanımda!")
+        locations.pop(final_name, None)
+
+    # Kullanıcı adını güncelle (konum, mesaj, puan vb.)
+    if admin_id in locations:
+        locations[final_name] = locations.pop(admin_id)
+        locations[final_name]["userId"] = final_name
+    if admin_id in location_history:
+        location_history[final_name] = location_history.pop(admin_id)
+
+    # Admin yetkisini kaldır
+    rooms[room_name]["createdBy"] = None
+    _critical_save_pending = True
+    return {"message": f"✅ Adminlik bırakıldı", "newName": final_name}
 
 @app.get("/get_room_password/{room_name}")
 def get_room_password(room_name: str, admin_id: str):
@@ -539,6 +781,7 @@ def get_room_password(room_name: str, admin_id: str):
 
 @app.post("/change_room_password/{room_name}")
 def change_room_password(room_name: str, admin_id: str, new_password: str):
+    global _critical_save_pending
     if room_name not in rooms:
         raise HTTPException(status_code=404, detail="Oda bulunamadı!")
     if rooms[room_name]["createdBy"] != admin_id:
@@ -546,6 +789,7 @@ def change_room_password(room_name: str, admin_id: str, new_password: str):
     if len(new_password) < 3:
         raise HTTPException(status_code=400, detail="Şifre en az 3 karakter!")
     rooms[room_name]["password"] = new_password
+    _critical_save_pending = True
     return {"message": "✅ Şifre değiştirildi"}
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -567,6 +811,7 @@ def get_room_permissions(room_name: str):
 
 @app.post("/set_collector_permission/{room_name}/{target_user}")
 def set_collector_permission(room_name: str, target_user: str, admin_id: str, enabled: bool):
+    global _critical_save_pending
     if room_name not in rooms:
         raise HTTPException(status_code=404, detail="Oda bulunamadı!")
     if rooms[room_name]["createdBy"] != admin_id:
@@ -577,10 +822,12 @@ def set_collector_permission(room_name: str, target_user: str, admin_id: str, en
     elif not enabled and target_user in collectors:
         collectors.remove(target_user)
     rooms[room_name]["collectors"] = collectors
+    _critical_save_pending = True
     return {"message": "✅ Yetki güncellendi", "collectors": collectors}
 
 @app.post("/set_voice_permission/{room_name}/{target_user}")
 def set_voice_permission(room_name: str, target_user: str, admin_id: str, enabled: bool):
+    global _critical_save_pending
     if room_name not in rooms:
         raise HTTPException(status_code=404, detail="Oda bulunamadı!")
     if rooms[room_name]["createdBy"] != admin_id:
@@ -591,6 +838,7 @@ def set_voice_permission(room_name: str, target_user: str, admin_id: str, enable
     elif not enabled and target_user in voice_allowed:
         voice_allowed.remove(target_user)
     rooms[room_name]["voiceAllowed"] = voice_allowed
+    _critical_save_pending = True
     return {"message": "✅ Ses yetkisi güncellendi", "voiceAllowed": voice_allowed}
 
 @app.post("/request_permission")
@@ -611,6 +859,7 @@ def request_permission(data: PermissionRequestModel):
 
 @app.post("/respond_permission")
 def respond_permission(data: PermissionRespondModel):
+    global _critical_save_pending
     if data.requestId not in permission_requests:
         raise HTTPException(status_code=404, detail="İstek bulunamadı!")
     req = permission_requests[data.requestId]
@@ -633,6 +882,7 @@ def respond_permission(data: PermissionRespondModel):
             if uid not in voice_allowed:
                 voice_allowed.append(uid)
             rooms[room_name]["voiceAllowed"] = voice_allowed
+    _critical_save_pending = True
     return {"message": "✅ Yanıt kaydedildi", "approved": data.approved}
 
 @app.get("/get_pending_requests/{user_id}")
@@ -663,12 +913,69 @@ def get_request_result(request_id: str, user_id: str):
     }
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# 👥 ARKADAŞLIK SİSTEMİ
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@app.post("/send_friend_request")
+def send_friend_request(data: FriendRequestModel):
+    global _critical_save_pending
+    # Zaten arkadaş mı?
+    if data.toUser in friends_map.get(data.fromUser, []):
+        raise HTTPException(status_code=400, detail="Zaten arkadaşsınız!")
+    # Bekleyen istek var mı?
+    for req in friend_requests.values():
+        if req["from"] == data.fromUser and req["to"] == data.toUser and req["status"] == "pending":
+            raise HTTPException(status_code=400, detail="Zaten bekleyen bir isteğiniz var!")
+    req_id = str(uuid.uuid4())[:8]
+    friend_requests[req_id] = {
+        "requestId": req_id,
+        "from":      data.fromUser,
+        "to":        data.toUser,
+        "status":    "pending",
+        "timestamp": get_local_time(),
+    }
+    _critical_save_pending = True
+    return {"requestId": req_id, "message": "✅ Arkadaşlık isteği gönderildi"}
+
+@app.get("/get_friend_requests/{user_id}")
+def get_friend_requests(user_id: str):
+    """user_id'ye gelen bekleyen istekler."""
+    result = [req for req in friend_requests.values()
+              if req["to"] == user_id and req["status"] == "pending"]
+    return result
+
+@app.post("/respond_friend_request")
+def respond_friend_request(data: FriendRespondModel):
+    global _critical_save_pending
+    if data.requestId not in friend_requests:
+        raise HTTPException(status_code=404, detail="İstek bulunamadı!")
+    req = friend_requests[data.requestId]
+    if req["to"] != data.toUser:
+        raise HTTPException(status_code=403, detail="Bu istek size ait değil!")
+    req["status"] = "accepted" if data.accepted else "rejected"
+    if data.accepted:
+        a, b = req["from"], req["to"]
+        # Her iki kullanıcının arkadaş listesine ekle
+        friends_map.setdefault(a, [])
+        friends_map.setdefault(b, [])
+        if b not in friends_map[a]: friends_map[a].append(b)
+        if a not in friends_map[b]: friends_map[b].append(a)
+    _critical_save_pending = True
+    return {"message": "✅ Yanıt kaydedildi", "accepted": data.accepted}
+
+@app.get("/get_friends/{user_id}")
+def get_friends(user_id: str):
+    return {"friends": friends_map.get(user_id, [])}
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # 👁️ GÖRÜNÜRLÜK
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @app.post("/set_visibility")
 def set_visibility(data: VisibilityModel):
+    global _critical_save_pending
     visibility_settings[data.userId] = {"mode": data.mode, "allowed": data.allowed}
+    _critical_save_pending = True
     return {"message": "✅ Görünürlük güncellendi"}
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -784,6 +1091,9 @@ def update_location(data: LocationModel):
         "lastSeen": now, "idleStatus": idle_status,
         "idleMinutes": idle_minutes, "idleStart": idle_start,
     }
+    # Odada aktif üye var → lastActivity sıfırla
+    if data.roomName != "Genel" and data.roomName in rooms:
+        rooms[data.roomName]["lastActivity"] = now
     return {"status": "ok", "time": now}
 
 @app.get("/get_locations/{room_name}")
@@ -840,16 +1150,34 @@ def get_locations(room_name: str, viewer_id: str = "", viewer_device_id: str = "
 
 @app.get("/get_offline_users")
 def get_offline_users(admin_id: str = "", device_id: str = "", token: str = ""):
-    if not is_super_admin(admin_id, device_id, token):
+    is_super = is_super_admin(admin_id, device_id, token)
+    # Oda kurucusunun yönettiği odalar
+    admin_rooms: set = set()
+    if not is_super and admin_id:
+        for rname, rdata in rooms.items():
+            if rdata.get("createdBy") == admin_id:
+                admin_rooms.add(rname)
+    if not is_super and not admin_rooms:
         raise HTTPException(status_code=403, detail="Yetkisiz!")
     result = []
     for uid, data in locations.items():
-        if not is_user_online(data.get("lastSeen", "")):
-            result.append({
-                "userId": uid, "lastSeen": data.get("lastSeen", ""),
-                "roomName": data.get("roomName", "Genel"),
-                "deviceType": data.get("deviceType", "phone"),
-            })
+        if is_user_online(data.get("lastSeen", "")):
+            continue
+        user_room = data.get("roomName", "Genel")
+        # Oda kurucusu sadece kendi odasındaki offline kullanıcıları görür
+        if not is_super and user_room not in admin_rooms:
+            continue
+        last_seen_str = data.get("lastSeen", "")
+        result.append({
+            "userId": uid,
+            "lastSeen": last_seen_str,
+            "agoText": _ago_text(last_seen_str),
+            "roomName": user_room,
+            "deviceType": data.get("deviceType", "phone"),
+            "lat": data.get("lat", 0),
+            "lng": data.get("lng", 0),
+            "character": data.get("character", "🧍"),
+        })
     return result
 
 @app.get("/get_location_history/{user_id}")
@@ -894,6 +1222,7 @@ def clear_history(user_id: str):
 
 @app.post("/create_pin")
 def create_pin(data: PinModel):
+    global _critical_save_pending
     for pin in pins.values():
         if pin["creator"] == data.creator and pin["roomName"] == data.roomName:
             raise HTTPException(status_code=400, detail="Zaten bir pininiz var! Önce kaldırın.")
@@ -903,6 +1232,7 @@ def create_pin(data: PinModel):
         "lat": data.lat, "lng": data.lng, "createdAt": get_local_time(),
         "collectorId": None, "collectionStart": None, "collectionTime": 0,
     }
+    _critical_save_pending = True
     return {"message": "✅ Pin yerleştirildi", "pinId": pin_id}
 
 @app.get("/get_pins/{room_name}")
@@ -911,11 +1241,13 @@ def get_pins(room_name: str):
 
 @app.delete("/remove_pin/{pin_id}")
 def remove_pin(pin_id: str, user_id: str):
+    global _critical_save_pending
     if pin_id not in pins:
         raise HTTPException(status_code=404, detail="Pin bulunamadı!")
     if pins[pin_id]["creator"] != user_id:
         raise HTTPException(status_code=403, detail="Sadece pin sahibi kaldırabilir!")
     del pins[pin_id]
+    _critical_save_pending = True
     return {"message": "✅ Pin kaldırıldı"}
 
 @app.get("/get_scores/{room_name}")
@@ -935,6 +1267,7 @@ def get_collection_history(room_name: str, user_id: str):
 
 @app.post("/send_message")
 def send_message(data: MessageModel):
+    global _critical_save_pending
     if data.fromUser in muted_users:
         raise HTTPException(403, "🔇 Mesaj gönderme yetkiniz kaldırılmıştır")
     key = get_conv_key(data.fromUser, data.toUser)
@@ -945,6 +1278,7 @@ def send_message(data: MessageModel):
         "from": data.fromUser, "to": data.toUser,
         "message": data.message, "timestamp": get_local_time(), "read": False,
     })
+    _critical_save_pending = True
     return {"message": "✅ Mesaj gönderildi"}
 
 @app.get("/get_conversation/{user1}/{user2}")
@@ -975,6 +1309,7 @@ def get_unread_count(user_id: str):
 
 @app.post("/send_room_message")
 def send_room_message(data: RoomMessageModel):
+    global _critical_save_pending
     if data.fromUser in muted_users:
         raise HTTPException(403, "🔇 Mesaj gönderme yetkiniz kaldırılmıştır")
     room = data.roomName
@@ -991,6 +1326,7 @@ def send_room_message(data: RoomMessageModel):
     })
     if len(room_messages[room]) > MAX_ROOM_MESSAGES:
         room_messages[room] = room_messages[room][-MAX_ROOM_MESSAGES:]
+    _critical_save_pending = True
     return {"message": "✅ Grup mesajı gönderildi"}
 
 @app.get("/get_room_messages/{room_name}")
@@ -1010,7 +1346,28 @@ def get_room_messages_since(room_name: str, last_id: str = ""):
 @app.get("/get_room_unread/{room_name}/{user_id}")
 def get_room_unread(room_name: str, user_id: str):
     msgs = room_messages.get(room_name, [])
-    return {"count": len(msgs), "lastId": msgs[-1]["id"] if msgs else ""}
+    if not msgs:
+        return {"count": 0, "lastId": ""}
+    last_read_id = room_message_reads.get(room_name, {}).get(user_id, "")
+    if not last_read_id:
+        return {"count": len(msgs), "lastId": msgs[-1]["id"]}
+    for i, msg in enumerate(msgs):
+        if msg["id"] == last_read_id:
+            unread = len(msgs) - i - 1
+            return {"count": unread, "lastId": msgs[-1]["id"]}
+    return {"count": len(msgs), "lastId": msgs[-1]["id"]}
+
+@app.post("/mark_room_read/{room_name}/{user_id}")
+def mark_room_read(room_name: str, user_id: str, last_id: str = ""):
+    """Kullanıcının okuduğu son mesajı işaretle."""
+    if room_name not in room_message_reads:
+        room_message_reads[room_name] = {}
+    msgs = room_messages.get(room_name, [])
+    if not last_id and msgs:
+        last_id = msgs[-1]["id"]
+    if last_id:
+        room_message_reads[room_name][user_id] = last_id
+    return {"ok": True}
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # 🎙️ SESLİ MESAJLAR (1-1)
@@ -1018,6 +1375,8 @@ def get_room_unread(room_name: str, user_id: str):
 
 @app.post("/send_voice_message")
 def send_voice_message(data: VoiceMessageModel):
+    if len(data.audioBase64) > MAX_AUDIO_B64:
+        raise HTTPException(400, "Ses dosyası çok büyük (max 2MB)")
     voice_id = str(uuid.uuid4())[:12]
     voice_messages[voice_id] = {
         "voiceId": voice_id,
@@ -1054,6 +1413,8 @@ def get_voice_message(voice_id: str):
 
 @app.post("/send_room_voice_message")
 def send_room_voice_message(data: RoomVoiceMessageModel):
+    if len(data.audioBase64) > MAX_AUDIO_B64:
+        raise HTTPException(400, "Ses dosyası çok büyük (max 2MB)")
     room = data.roomName
     if room != "Genel" and room not in rooms:
         raise HTTPException(status_code=404, detail="Oda bulunamadı!")
@@ -1091,6 +1452,8 @@ def get_room_voice_message(voice_id: str):
 
 @app.post("/walkie_send")
 def walkie_send(data: WalkieSendModel):
+    if len(data.audioBase64) > MAX_AUDIO_B64:
+        raise HTTPException(400, "Ses dosyası çok büyük (max 2MB)")
     key = get_conv_key(data.fromUser, data.toUser)
     walkie_queue[key] = {
         "id": str(uuid.uuid4())[:8],
@@ -1115,6 +1478,8 @@ def walkie_listen(user_id: str, other_user: str, last_id: str = ""):
 
 @app.post("/room_walkie_send")
 def room_walkie_send(data: RoomWalkieSendModel):
+    if len(data.audioBase64) > MAX_AUDIO_B64:
+        raise HTTPException(400, "Ses dosyası çok büyük (max 2MB)")
     room = data.roomName
     if room not in room_walkie_queue:
         room_walkie_queue[room] = []
@@ -1185,6 +1550,8 @@ def music_start(data: MusicStartModel):
 
 @app.post("/music_chunk")
 def music_chunk(data: MusicChunkModel):
+    if len(data.audioBase64) > MAX_AUDIO_B64:
+        raise HTTPException(400, "Ses dosyası çok büyük (max 2MB)")
     if data.roomName not in music_broadcasts:
         raise HTTPException(status_code=404, detail="Yayın bulunamadı!")
     broadcast = music_broadcasts[data.roomName]
@@ -1260,6 +1627,9 @@ def super_admin_login(data: dict):
         "expiresAt": datetime.now(DEFAULT_TIMEZONE) + timedelta(hours=24),
         "deviceId": requester_device,
     }
+    global _critical_save_pending
+    _critical_save_pending = True
+    _flush_critical_data()  # Anında diske yaz — restart sonrası kaybolmasın
     return {"token": token, "message": "✅ Süper admin girişi başarılı"}
 
 @app.post("/super_admin_logout")
@@ -1305,8 +1675,51 @@ def get_all_rooms_info(admin_id: str = "", device_id: str = "", token: str = "")
 
 @app.post("/register_fcm_token")
 def register_fcm_token(data: FcmTokenModel):
+    global _critical_save_pending
     fcm_tokens[data.userId] = data.token
+    _critical_save_pending = True
     return {"message": "✅ FCM token kaydedildi"}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 📞 GERÇEK ZAMANLI SESLİ ARAMA (WebSocket)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@app.websocket("/ws/voice/room/{room_name}")
+async def ws_room_voice(ws: WebSocket, room_name: str):
+    """Oda sesli araması — gelen PCM chunk'ını odadaki herkese iletir."""
+    await ws.accept()
+    _room_voice_ws[room_name].add(ws)
+    try:
+        while True:
+            data = await ws.receive_bytes()
+            dead = set()
+            for peer in list(_room_voice_ws[room_name]):
+                if peer is ws:
+                    continue
+                try:
+                    await peer.send_bytes(data)
+                except Exception:
+                    dead.add(peer)
+            _room_voice_ws[room_name] -= dead
+    except WebSocketDisconnect:
+        _room_voice_ws[room_name].discard(ws)
+
+@app.websocket("/ws/voice/p2p/{caller}/{callee}")
+async def ws_p2p_voice(ws: WebSocket, caller: str, callee: str):
+    """Birebir sesli arama — caller → callee yönünde PCM iletir."""
+    await ws.accept()
+    _p2p_voice_ws[caller] = ws
+    try:
+        while True:
+            data = await ws.receive_bytes()
+            peer = _p2p_voice_ws.get(callee)
+            if peer:
+                try:
+                    await peer.send_bytes(data)
+                except Exception:
+                    _p2p_voice_ws.pop(callee, None)
+    except WebSocketDisconnect:
+        _p2p_voice_ws.pop(caller, None)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # 🤝 KULLANICI ADI DEĞİŞTİRME
@@ -1416,6 +1829,25 @@ def change_username(data: ChangeUsernameModel):
         allowed = vs.get("allowed", [])
         if old in allowed:
             allowed.remove(old); allowed.append(new)
+    # Rota kütüphanesi: creator, participants, likes, suggestions
+    for room_routes in route_library.values():
+        for route in room_routes:
+            if route.get("creator") == old:
+                route["creator"] = new
+            if old in route.get("participants", []):
+                route["participants"].remove(old)
+                route["participants"].append(new)
+            if old in route.get("likes", []):
+                route["likes"].remove(old)
+                route["likes"].append(new)
+            for sug in route.get("suggestions", []):
+                if sug.get("userId") == old:
+                    sug["userId"] = new
+    _flush_route_library()
+    # Transport rolleri
+    for room_roles in transport_roles.values():
+        if old in room_roles:
+            room_roles[new] = room_roles.pop(old)
     return {"message": f"✅ İsim değiştirildi: {old} → {new}"}
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1601,6 +2033,7 @@ def add_route_library(data: RouteLibraryModel):
         "maxParticipants": data.maxParticipants,
         "participants": [],
         "likes": [],
+        "suggestions": [],
     })
     _flush_route_library()
     return {"id": route_id, "message": "✅ Rota kütüphaneye eklendi"}
@@ -1663,6 +2096,59 @@ def delete_route_library(room_name: str, route_id: str, user_id: str):
     route_library[room_name] = [r for r in lib if r["id"] != route_id]
     _flush_route_library()
     return {"message": "✅ Silindi"}
+
+@app.put("/route_library/{room_name}/{route_id}")
+def update_route_library(room_name: str, route_id: str, data: dict):
+    user_id = data.get("userId", "").strip()
+    lib = route_library.get(room_name, [])
+    route = next((r for r in lib if r["id"] == route_id), None)
+    if not route:
+        raise HTTPException(status_code=404, detail="Rota bulunamadı")
+    if route["creator"] != user_id and not is_super_admin(user_id):
+        raise HTTPException(status_code=403, detail="Sadece oluşturan güncelleyebilir")
+    for field in ["name", "startDate", "endDate", "announceDate", "announceEndDate",
+                  "info", "maxParticipants", "waypoints", "distKm", "durMin"]:
+        if field in data:
+            val = data[field]
+            if isinstance(val, str) and val.strip() == "":
+                route[field] = None
+            else:
+                route[field] = val
+    _flush_route_library()
+    return {"message": "✅ Rota güncellendi"}
+
+@app.post("/route_library/{room_name}/{route_id}/suggest")
+def add_route_suggestion(room_name: str, route_id: str, data: dict):
+    lib = route_library.get(room_name, [])
+    route = next((r for r in lib if r["id"] == route_id), None)
+    if not route:
+        raise HTTPException(status_code=404, detail="Rota bulunamadı")
+    user_id = data.get("userId", "").strip()
+    text = data.get("text", "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="Öneri boş olamaz")
+    suggestions = route.setdefault("suggestions", [])
+    suggestions.append({
+        "id": str(uuid.uuid4())[:8],
+        "userId": user_id,
+        "text": text,
+        "timestamp": get_local_time(),
+    })
+    _flush_route_library()
+    # Organizatöre bildirim gönder
+    creator = route.get("creator", "")
+    if creator and creator != user_id:
+        route_name = route.get("name", "Rota")
+        key = get_conv_key("sistem", creator)
+        if key not in messages:
+            messages[key] = []
+        messages[key].append({
+            "id": str(uuid.uuid4())[:8],
+            "from": "sistem", "to": creator,
+            "message": f"💡 {user_id}, \"{route_name}\" organizasyonuna öneri ekledi: {text[:80]}",
+            "timestamp": get_local_time(), "read": False,
+        })
+    return {"message": "✅ Öneri eklendi", "suggestions": suggestions}
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # 📌 ODA POI NOKTALARI (mola/kamp/vb.)
@@ -1751,6 +2237,7 @@ def kick_user(room_name: str, target_user: str, admin_id: str,
 
 @app.post("/super_admin_ban")
 def super_admin_ban(data: dict):
+    global _critical_save_pending
     admin_id  = data.get("adminId", ""); token = data.get("token", "")
     device_id = data.get("deviceId", ""); target = data.get("targetUser", "").strip()
     reason    = data.get("reason", "Süper admin kararı").strip()
@@ -1766,6 +2253,7 @@ def super_admin_ban(data: dict):
     if target in locations:
         locations[target]["roomName"] = "Genel"
     kicked_users[target] = {"roomName": "Genel", "kickedAt": now, "kickedBy": f"⛔ BAN: {admin_id}"}
+    _critical_save_pending = True
     return {"message": f"✅ {target} banlandı"}
 
 @app.post("/super_admin_unban")
@@ -1775,8 +2263,10 @@ def super_admin_unban(data: dict):
     if not is_super_admin(admin_id, device_id, token):
         raise HTTPException(403, "Yetkisiz")
     device = banned_users.get(target, {}).get("deviceId", "")
+    global _critical_save_pending
     banned_users.pop(target, None)
     if device: banned_devices.pop(device, None)
+    _critical_save_pending = True
     return {"message": f"✅ {target} banı kaldırıldı"}
 
 @app.post("/super_admin_mute")
@@ -1788,10 +2278,12 @@ def super_admin_mute(data: dict):
         raise HTTPException(403, "Yetkisiz")
     if not target: raise HTTPException(400, "Hedef kullanıcı belirtilmedi")
     now = get_local_time()
+    global _critical_save_pending
     muted_users[target] = {"mutedAt": now, "mutedBy": admin_id, "reason": reason}
     for room in rooms.values():
         va = room.get("voiceAllowed", [])
         if target in va: va.remove(target)
+    _critical_save_pending = True
     return {"message": f"🔇 {target} susturuldu"}
 
 @app.post("/super_admin_unmute")
@@ -1800,7 +2292,9 @@ def super_admin_unmute(data: dict):
     device_id = data.get("deviceId", ""); target = data.get("targetUser", "").strip()
     if not is_super_admin(admin_id, device_id, token):
         raise HTTPException(403, "Yetkisiz")
+    global _critical_save_pending
     muted_users.pop(target, None)
+    _critical_save_pending = True
     return {"message": f"🔊 {target} susturması kaldırıldı"}
 
 @app.post("/super_admin_kick")
